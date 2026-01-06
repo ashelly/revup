@@ -106,6 +106,10 @@ cache. Can also change the commit text.
 **revup commit**
 : A convenience wrapper for revup amend --insert
 
+**revup edit**
+: Interactively edit commits in a topic, allowing modification of files
+as they existed at that point in history.
+
 **revup cherry-pick**
 : Create a squashed commit that represents the changes made in the
 given branch relative to its base branch, then cherry-pick it.
