@@ -122,6 +122,10 @@ given branch relative to its base branch, then cherry-pick it.
 **revup toolkit**
 : Various low-level subfunctionalities intended for advanced users or scripts.
 
+**revup edit**
+: Interactively edit commits in a topic, allowing modification of files
+as they existed at that point in history.
+
 **revup completion**
 : Output shell completion scripts. Currently supports bash.
 To enable, run `revup completion bash --install` or manually add to

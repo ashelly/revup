@@ -205,6 +205,7 @@ def create_parsers() -> Tuple[RevupArgParser, List[RevupArgParser]]:
         add_help=False,
     )
     amend_parser = subparsers.add_parser("amend", aliases=["commit"], add_help=False)
+    edit_parser = subparsers.add_parser("edit", add_help=False)
     config_parser = subparsers.add_parser(
         "config",
         add_help=False,
@@ -233,6 +234,8 @@ def create_parsers() -> Tuple[RevupArgParser, List[RevupArgParser]]:
         p.add_argument("--help", "-h", action=HelpAction, nargs=0)
         p.add_argument("--base-branch", "-b")
         p.add_argument("--relative-branch", "-e")
+
+    edit_parser.add_argument("--help", "-h", action=HelpAction, nargs=0)
 
     upload_parser.add_argument("topics", nargs="*")
     upload_parser.add_argument("--rebase", "-r", action="store_true")
@@ -263,6 +266,10 @@ def create_parsers() -> Tuple[RevupArgParser, List[RevupArgParser]]:
     upload_parser.add_argument("--head", default="HEAD")
 
     restack_parser.add_argument("--topicless-last", "-t", action="store_true")
+
+    edit_parser.add_argument("topic", nargs="?")
+    edit_parser.add_argument("--commit", "-c", action="store_true")
+    edit_parser.add_argument("--abort", "-a", action="store_true")
 
     amend_parser.add_argument("ref_or_topic", nargs="?")
     amend_parser.add_argument("--edit", "-s", default=True, action="store_true")
@@ -412,6 +419,11 @@ async def main() -> int:
         from revup import restack
 
         return await restack.main(args=args, git_ctx=git_ctx)
+
+    elif args.cmd == "edit":
+        from revup import edit
+
+        return await edit.main(args=args, git_ctx=git_ctx)
 
     async with github_connection(args=args, git_ctx=git_ctx, conf=conf) as (
         github_ep,
