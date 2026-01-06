@@ -185,9 +185,13 @@ async def github_connection(
         await github_ep.close()
 
 
-async def main() -> int:
-    # Description / help text isn't given to the parser since the actual
-    # help text is in the markdown files.
+def create_parsers() -> Tuple[RevupArgParser, List[RevupArgParser]]:
+    """
+    Create and return all argument parsers.
+
+    Returns:
+        Tuple of (main_parser, configurable_parsers)
+    """
     revup_parser = make_toplevel_parser()
     subparsers = revup_parser.add_subparsers(dest="cmd", required=True, parser_class=RevupArgParser)
 
@@ -209,6 +213,12 @@ async def main() -> int:
     toolkit_parser = subparsers.add_parser(
         "toolkit", description="Exercise various subfunctionalities."
     )
+    completion_parser = subparsers.add_parser(
+        "completion", description="Output shell completion script."
+    )
+    completion_parser.add_argument("shell", choices=["bash"])
+    completion_parser.add_argument("--install", "-i", action="store_true",
+                                   help="Install completion to shell rc file")
 
     # Intentionally does not contain config or toolkit parsers since the those are not configurable
     all_parsers: List[RevupArgParser] = [
@@ -341,6 +351,14 @@ async def main() -> int:
         help="Print the titles for all commits within a topic",
     )
 
+    return revup_parser, all_parsers
+
+
+async def main() -> int:
+    # Description / help text isn't given to the parser since the actual
+    # help text is in the markdown files.
+    revup_parser, all_parsers = create_parsers()
+
     # Do an initial parsing pass, which handles HelpAction
     args = revup_parser.parse_args()
     conf = await get_config()
@@ -350,6 +368,12 @@ async def main() -> int:
     if args.cmd == "config":
         logs.configure_logger(False, {})
         return config.config_main(conf, args, all_parsers)
+
+    # Completion doesn't need git context or full config
+    if args.cmd == "completion":
+        from revup import completion
+
+        return completion.main(args=args, main_parser=revup_parser)
 
     for p in all_parsers:
         assert isinstance(p, RevupArgParser)

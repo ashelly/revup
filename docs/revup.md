@@ -126,6 +126,11 @@ given branch relative to its base branch, then cherry-pick it.
 : Interactively edit commits in a topic, allowing modification of files
 as they existed at that point in history.
 
+**revup completion**
+: Output shell completion scripts. Currently supports bash.
+To enable, run `revup completion bash --install` or manually add to
+your ~/.bashrc: `eval "$(revup completion bash)"`
+
 # ISSUES
 
 See https://github.com/Skydio/revup/issues for a list of known issues.
