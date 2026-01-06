@@ -122,6 +122,10 @@ given branch relative to its base branch, then cherry-pick it.
 **revup toolkit**
 : Various low-level subfunctionalities intended for advanced users or scripts.
 
+**revup edit**
+: Interactively edit commits in a topic, allowing modification of files
+as they existed at that point in history.
+
 # ISSUES
 
 See https://github.com/Skydio/revup/issues for a list of known issues.
