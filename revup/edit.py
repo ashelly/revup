@@ -12,23 +12,110 @@ import argparse
 import logging
 import os
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Set
+from typing import List, Optional, Set, Tuple
 
 from revup import git, topic_stack
+from revup.topic_stack import RE_TAGS, TAG_TOPIC
 from revup.types import RevupUsageException
 
 
-def is_in_rebase(repo_path: Path) -> bool:
-    """Check if we're currently in a rebase state."""
+@dataclass
+class EditState:
+    """State detected during commit_and_continue."""
+    should_amend: bool
+    has_staged: bool
+    topic_name: Optional[str]
+    topic_commits: Set[str]
+    off_topic_reason: str
+
+
+def get_git_dir(repo_path: Path) -> Path:
+    """Get the actual .git directory, handling worktrees."""
     git_dir = repo_path / ".git"
     if git_dir.is_file():
         # Handle worktrees where .git is a file pointing to the real git dir
         content = git_dir.read_text().strip()
         if content.startswith("gitdir: "):
             git_dir = Path(content[8:])
+    return git_dir
 
+
+def is_in_rebase(repo_path: Path) -> bool:
+    """Check if we're currently in a rebase state."""
+    git_dir = get_git_dir(repo_path)
     return (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists()
+
+
+def get_edit_state_path(repo_root: str) -> Path:
+    """State file inside rebase-merge - auto-cleaned by git when rebase ends."""
+    git_dir = get_git_dir(Path(repo_root))
+    return git_dir / "rebase-merge" / "revup-edit-topic"
+
+
+def save_edit_state(repo_root: str, topic_name: str, topic_commits: Set[str]) -> None:
+    """Save topic being edited. Only valid while rebase is active."""
+    path = get_edit_state_path(repo_root)
+    path.write_text(f"{topic_name}\n" + "\n".join(topic_commits))
+
+
+def load_edit_state(repo_root: str) -> Optional[Tuple[str, Set[str]]]:
+    """Load edit state. Returns None if not in revup-initiated rebase."""
+    path = get_edit_state_path(repo_root)
+    if not path.exists():
+        return None
+    lines = path.read_text().strip().split("\n")
+    if len(lines) < 2:
+        return None
+    return (lines[0], set(lines[1:]))
+
+
+def get_stopped_commit(repo_root: str) -> Optional[str]:
+    """Get commit we're stopped at during rebase."""
+    git_dir = get_git_dir(Path(repo_root))
+    path = git_dir / "rebase-merge" / "stopped-sha"
+    return path.read_text().strip() if path.exists() else None
+
+
+async def get_commit_topic(git_ctx: git.Git, commit: str) -> Optional[str]:
+    """Extract the Topic: tag from a commit message using shared regex."""
+    message = await git_ctx.git_stdout("log", "-1", "--format=%B", commit)
+    for line in message.split("\n"):
+        m = RE_TAGS.match(line)
+        if m and m.group("tagname").lower() == TAG_TOPIC:
+            return m.group("tagvalue").strip()
+    return None
+
+
+def matches_any_topic_commit(commit_hash: str, topic_commits: Set[str]) -> bool:
+    """Check if commit_hash matches any topic commit (handles short/long hashes)."""
+    return any(
+        commit_hash.startswith(tc[:len(commit_hash)]) or tc.startswith(commit_hash)
+        for tc in topic_commits
+    )
+
+
+async def count_commits_after(git_ctx: git.Git, topic_commits: Set[str]) -> int:
+    """Count commits processed after the last topic commit in the rebase."""
+    done_path = get_git_dir(Path(git_ctx.repo_root)) / "rebase-merge" / "done"
+    if not done_path.exists():
+        return 0
+
+    lines = done_path.read_text().strip().split("\n")
+    hashes = [parts[1] for line in lines if len(parts := line.split()) >= 2]
+
+    # Find last topic commit by iterating backwards, return count after it
+    for i in range(len(hashes) - 1, -1, -1):
+        if matches_any_topic_commit(hashes[i], topic_commits):
+            return len(hashes) - i - 1
+    return 0
+
+
+async def has_unmerged_files(git_ctx: git.Git) -> bool:
+    """Check for unresolved conflicts."""
+    output = await git_ctx.git_stdout("ls-files", "-u")
+    return bool(output.strip())
 
 
 def generate_rebase_sequence(commits: List[str], topic_commits: Set[str]) -> str:
@@ -143,8 +230,11 @@ async def start_edit(args: argparse.Namespace, git_ctx: git.Git) -> int:
 
     if in_rebase:
         # Stopped at an edit point - this is the expected flow
+        # Save state so commit_and_continue knows which commits are topic commits
+        save_edit_state(git_ctx.repo_root, topic_name, topic_commits)
+
         logging.info("")
-        logging.info("Rebase stopped for editing. Make your changes, then run:")
+        logging.info(f"Rebase stopped for editing topic '{topic_name}'. Make your changes, then run:")
         logging.info("  revup edit --commit")
         logging.info("")
         logging.info("Other options:")
@@ -161,19 +251,93 @@ async def start_edit(args: argparse.Namespace, git_ctx: git.Git) -> int:
     return 0
 
 
-async def commit_and_continue(args: argparse.Namespace, git_ctx: git.Git) -> int:
-    """Amend the current commit and continue the rebase."""
-    if not is_in_rebase(Path(git_ctx.repo_root)):
-        raise RevupUsageException(
-            "Not in a rebase. Start an edit session with: revup edit <topic>"
-        )
+async def detect_edit_state(git_ctx: git.Git) -> EditState:
+    """Analyze current rebase state to determine what action to take."""
+    # Check if there are staged changes
+    has_staged = await git_ctx.git_return_code("diff", "--cached", "--quiet") != 0
 
-    # Run git commit --amend
+    # Determine if we should amend based on edit state
+    state = load_edit_state(git_ctx.repo_root)
+    stopped = get_stopped_commit(git_ctx.repo_root)
+
+    should_amend = False
+    topic_name: Optional[str] = None
+    topic_commits: Set[str] = set()
+    if state and stopped:
+        topic_name, topic_commits = state
+        # Check if stopped commit matches any topic commit
+        should_amend = matches_any_topic_commit(stopped, topic_commits)
+
+    # Build informative message for non-topic commits
+    off_topic_reason = "No revup edit state found"
+    if state and stopped and not should_amend:
+        current_topic = await get_commit_topic(git_ctx, "HEAD")
+        commits_after = await count_commits_after(git_ctx, topic_commits)
+        topic_desc = f"' for {current_topic}'" if current_topic else ""
+        off_topic_reason = f"Stopped at commit{topic_desc}, {commits_after} commit(s) after '{topic_name}'."
+
+    return EditState(
+        should_amend=should_amend,
+        has_staged=has_staged,
+        topic_name=topic_name,
+        topic_commits=topic_commits,
+        off_topic_reason=off_topic_reason,
+    )
+
+
+def check_rebase_continues(git_ctx: git.Git, result_code: int) -> int:
+    """Check if rebase stopped again, log appropriate message, return exit code."""
+    if is_in_rebase(Path(git_ctx.repo_root)):
+        logging.info("")
+        logging.info("Rebase stopped at next point. Make your changes, then run:")
+        logging.info("  revup edit --commit")
+        return 0
+
+    if result_code == 0:
+        logging.info("Edit session complete.")
+    return result_code
+
+
+def handle_drop_commit(git_ctx: git.Git, state: EditState) -> int:
+    """Handle case where conflict resolution resulted in no changes - drop the commit."""
+    logging.info(state.off_topic_reason)
+    logging.info("No changes from previous commit after resolution.")
+    confirm = input("Drop this commit? [Y/n]: ").strip().lower()
+    if confirm and confirm != "y":
+        logging.info("Aborted. Run 'revup edit --commit' again or 'git rebase --abort'.")
+        return 1
+
+    logging.info("Dropping commit...")
+    skip_result = subprocess.run(
+        [git_ctx.git_path, "rebase", "--skip"],
+        cwd=git_ctx.repo_root,
+    )
+    return check_rebase_continues(git_ctx, skip_result.returncode)
+
+
+def handle_amend_and_continue(git_ctx: git.Git, state: EditState) -> int:
+    """Handle amending a topic commit and continuing the rebase."""
+    # Warn if no staged changes
+    if not state.has_staged:
+        logging.warning(f"No staged changes to amend on topic '{state.topic_name}'.")
+        logging.warning("Did you forget to 'git add' your changes?")
+        confirm = input("Continue anyway (edit commit message only)? [y/N]: ").strip().lower()
+        if confirm != "y":
+            logging.info("Aborted. Stage your changes and run 'revup edit --commit' again.")
+            return 1
+    else:
+        # Confirm action
+        logging.info(f"Stopped on topic '{state.topic_name}' commit")
+        confirm = input("Proceed to AMEND this commit and continue? [Y/n]: ").strip().lower()
+        if confirm and confirm != "y":
+            logging.info("Aborted. Run 'revup edit --commit' again or 'git rebase --abort'.")
+            return 1
+
+    logging.info("Amending topic commit...")
     amend_result = subprocess.run(
         [git_ctx.git_path, "commit", "--amend"],
         cwd=git_ctx.repo_root,
     )
-
     if amend_result.returncode != 0:
         logging.error("Amend failed. Resolve any issues and try again.")
         return 1
@@ -183,17 +347,51 @@ async def commit_and_continue(args: argparse.Namespace, git_ctx: git.Git) -> int
         [git_ctx.git_path, "rebase", "--continue"],
         cwd=git_ctx.repo_root,
     )
+    return check_rebase_continues(git_ctx, continue_result.returncode)
 
-    # Check if we're still in a rebase (more edits to go)
-    if is_in_rebase(Path(git_ctx.repo_root)):
-        logging.info("")
-        logging.info("Rebase stopped at next edit point. Make your changes, then run:")
-        logging.info("  revup edit --commit")
-        return 0
 
-    if continue_result.returncode == 0:
-        logging.info("Edit session complete.")
-    return continue_result.returncode
+def handle_continue_only(git_ctx: git.Git, state: EditState) -> int:
+    """Handle continuing rebase without amending (conflict resolution with changes)."""
+    logging.info(state.off_topic_reason)
+    confirm = input("Proceed to CONTINUE without amending? [Y/n]: ").strip().lower()
+    if confirm and confirm != "y":
+        logging.info("Aborted. Run 'revup edit --commit' again or 'git rebase --abort'.")
+        return 1
+
+    logging.info("Continuing without amend...")
+    continue_result = subprocess.run(
+        [git_ctx.git_path, "rebase", "--continue"],
+        cwd=git_ctx.repo_root,
+    )
+    return check_rebase_continues(git_ctx, continue_result.returncode)
+
+
+async def commit_and_continue(args: argparse.Namespace, git_ctx: git.Git) -> int:
+    """Orchestrator: validate state, detect action needed, dispatch to handler."""
+    # Validation: must be in a rebase
+    if not is_in_rebase(Path(git_ctx.repo_root)):
+        raise RevupUsageException(
+            "Not in a rebase. Start an edit session with: revup edit <topic>"
+        )
+
+    # Validation: no unresolved conflicts
+    if await has_unmerged_files(git_ctx):
+        raise RevupUsageException(
+            "Unresolved conflicts. Fix them first:\n"
+            "  1. Edit conflicting files\n"
+            "  2. git add <files>\n"
+            "  3. revup edit --commit"
+        )
+
+    # Detect state and dispatch to appropriate handler
+    state = await detect_edit_state(git_ctx)
+
+    if not state.should_amend and not state.has_staged:
+        return handle_drop_commit(git_ctx, state)
+    elif state.should_amend:
+        return handle_amend_and_continue(git_ctx, state)
+    else:
+        return handle_continue_only(git_ctx, state)
 
 
 async def abort_edit(git_ctx: git.Git) -> int:
