@@ -129,6 +129,33 @@ async def parse_ref_or_topic(
         raise RevupUsageException("Can't have both --no-parse-refs and --no-parse-topics!")
 
 
+async def build_commit_template(
+    topic_name: str,
+    include_relative: bool,
+    commit: str,
+    git_ctx: git.Git,
+    topics: topic_stack.TopicStack,
+) -> str:
+    """Build commit message template with Topic: and optionally Relative: tags."""
+    template_lines = ["Feature: <feature description>", "", f"Topic: {topic_name}"]
+
+    if include_relative:
+        await topics.populate_topics()
+        commit_id = await git_ctx.git_stdout("rev-parse", commit)
+
+        # Find topic containing the commit we're inserting after
+        for topic in topics.topics.values():
+            for c in topic.original_commits:
+                if c.commit_id == commit_id:
+                    template_lines.append(f"Relative: {topic.name}")
+                    break
+            else:
+                continue
+            break
+
+    return "\n".join(template_lines)
+
+
 async def main(args: argparse.Namespace, git_ctx: git.Git) -> int:
     """
     Amend the given commit and recreate the history on top of that commit to make
@@ -152,6 +179,13 @@ async def main(args: argparse.Namespace, git_ctx: git.Git) -> int:
 
     if args.drop and args.insert:
         raise RevupUsageException("Doesn't make sense to drop and insert")
+
+    # --topic and --relative only work with 'commit' command, not 'amend'
+    if (args.topic or args.relative) and args.cmd != "commit":
+        raise RevupUsageException("--topic and --relative are only valid for 'revup commit'")
+
+    if args.relative and not args.topic:
+        raise RevupUsageException("--relative requires --topic")
 
     if has_unstaged:
         await git_ctx.git("add", "--update")
@@ -196,7 +230,14 @@ async def main(args: argparse.Namespace, git_ctx: git.Git) -> int:
         stack[0].committer_name = ""
         stack[0].committer_email = ""
         stack[0].committer_date = ""
-        stack[0].commit_msg = ""
+
+        # Build commit message template if --topic was provided
+        if args.topic:
+            stack[0].commit_msg = await build_commit_template(
+                args.topic, args.relative, commit, git_ctx, topics
+            )
+        else:
+            stack[0].commit_msg = ""
 
     if args.edit and not args.drop:
         new_msg = await invoke_editor_for_commit_msg(
