@@ -77,6 +77,12 @@ for the definition of a relative branch.
 **--no-parse-refs**
 : Don't attempt to parse the target as a commit or branch name.
 
+**--relative, -r `<topic>`**
+: Add or update a `Relative:` tag in the commit message. This sets
+the relative topic dependency for the commit. If the commit already
+has a different `Relative:` tag, you will be prompted to confirm
+the replacement.
+
 # EXAMPLES
 
 Edits the third commit down in the stack.
@@ -86,3 +92,11 @@ Edits the third commit down in the stack.
 Edits the most recent commit in the topic `mytopic`:
 
 : $ `revup amend mytopic`
+
+Adds a relative dependency to a topic's commit:
+
+: $ `revup amend --relative base_topic mytopic`
+
+This adds `Relative: base_topic` to the commit message of `mytopic`.
+If the commit already has a different `Relative:` tag, you'll be prompted
+to confirm the replacement.
