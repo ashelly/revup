@@ -287,6 +287,11 @@ def create_parsers() -> Tuple[RevupArgParser, List[RevupArgParser]]:
 
     amend_parser.add_argument("--parse-topics", default=True, action="store_true")
     amend_parser.add_argument("--parse-refs", default=True, action="store_true")
+    amend_parser.add_argument("--topic", "-t", help="Pre-fill commit message with Topic: tag")
+    amend_parser.add_argument(
+        "--relative", "-r", nargs="?", const=True, default=False,
+        help="Add Relative: tag. Auto-detects if no topic given, or specify explicitly."
+    )
 
     cherry_pick_parser.add_argument("--help", "-h", action=HelpAction, nargs=0)
     cherry_pick_parser.add_argument("branch", nargs=1)
