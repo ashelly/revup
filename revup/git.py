@@ -200,6 +200,9 @@ async def make_git(
                 'Branch {} not found, falling back to "{}". We recommend you set this in'
                 " .revupconfig".format(main_branch, git_ctx.main_branch)
             )
+
+    await git_ctx.check_remote_exists()
+
     return git_ctx
 
 
@@ -304,6 +307,17 @@ class Git:
 
     async def git_stdout(self, *args: str, **kwargs: Any) -> str:
         return (await self.git(*args, **kwargs))[1]
+
+    async def check_remote_exists(self) -> None:
+        """Verify the configured remote exists, raise helpful error if not."""
+        remote_exists = await self.git_return_code(
+            "remote", "get-url", self.remote_name
+        ) == 0
+        if not remote_exists:
+            raise RevupUsageException(
+                f"Remote '{self.remote_name}' not found.\n"
+                "Revup requires a remote to determine the base branch.\n"
+            )
 
     async def get_github_repo_info(self, github_url: str, remote_name: str) -> GitHubRepoInfo:
         """
