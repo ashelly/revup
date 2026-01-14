@@ -283,6 +283,9 @@ def create_parsers() -> Tuple[RevupArgParser, List[RevupArgParser]]:
     amend_parser.add_argument(
         "--relative", "-r", action="store_true", help="Also add Relative: tag (requires --topic)"
     )
+    amend_parser.add_argument(
+        "--draft", action="store_true", help="Add Label: draft tag (requires --topic)"
+    )
 
     cherry_pick_parser.add_argument("--help", "-h", action=HelpAction, nargs=0)
     cherry_pick_parser.add_argument("branch", nargs=1)
