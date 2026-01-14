@@ -132,11 +132,12 @@ async def parse_ref_or_topic(
 async def build_commit_template(
     topic_name: str,
     include_relative: bool,
+    include_draft: bool,
     commit: str,
     git_ctx: git.Git,
     topics: topic_stack.TopicStack,
 ) -> str:
-    """Build commit message template with Topic: and optionally Relative: tags."""
+    """Build commit message template with Topic: and optionally Relative:/Label: tags."""
     template_lines = ["Feature: <feature description>", "", f"Topic: {topic_name}"]
 
     if include_relative:
@@ -152,6 +153,9 @@ async def build_commit_template(
             else:
                 continue
             break
+
+    if include_draft:
+        template_lines.append("Label: draft")
 
     return "\n".join(template_lines)
 
@@ -234,7 +238,7 @@ async def main(args: argparse.Namespace, git_ctx: git.Git) -> int:
         # Build commit message template if --topic was provided
         if args.topic:
             stack[0].commit_msg = await build_commit_template(
-                args.topic, args.relative, commit, git_ctx, topics
+                args.topic, args.relative, args.draft, commit, git_ctx, topics
             )
         else:
             stack[0].commit_msg = ""
