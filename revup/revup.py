@@ -299,6 +299,16 @@ def create_parsers() -> Tuple[RevupArgParser, List[RevupArgParser]]:
         "--relative", "-r", nargs="?", const=True, default=False,
         help="Add Relative: tag. Auto-detects if no topic given, or specify explicitly."
     )
+    amend_parser.add_argument(
+        "--type", help="Conventional commit type (feat, fix, chore, etc.)"
+    )
+    amend_parser.add_argument(
+        "--scope", help="Conventional commit scope"
+    )
+    amend_parser.add_argument(
+        "--draft", action="store_true", help="Add Label: draft tag (requires --topic)"
+    )    
+    amend_parser.add_argument("--commit-message-script")
 
     cherry_pick_parser.add_argument("--help", "-h", action=HelpAction, nargs=0)
     cherry_pick_parser.add_argument("branch", nargs=1)

@@ -225,6 +225,7 @@ async def parse_ref_or_topic(
 async def build_commit_template(
     topic_name: str,
     relative: bool | str,
+    include_draft: bool,
     commit: str,
     git_ctx: git.Git,
     topics: topic_stack.TopicStack,
@@ -234,6 +235,7 @@ async def build_commit_template(
     Args:
         topic_name: The topic name for the new commit
         relative: False to skip, True to auto-detect, or a string topic name to use explicitly
+        include_draft: add a draft label
         commit: The commit being inserted after (used for auto-detection)
         git_ctx: Git context
         topics: Topic stack for looking up topics
@@ -262,6 +264,9 @@ async def build_commit_template(
                 else:
                     continue
                 break
+
+    if include_draft:
+        template_lines.append("Label: draft")
 
     return "\n".join(template_lines)
 
@@ -322,7 +327,7 @@ async def prepare_insert_commit(
             staged_files = await get_staged_files(git_ctx)
             commit_msg = run_commit_message_script(
                 script_path=args.commit_message_script, topic=args.topic,
-                relative=args.relative,
+                relative=args.relative, args=args.draft,
                 commit_type=getattr(args, "type", None), scope=getattr(args, "scope", None),
                 staged_files=staged_files, repo_root=git_ctx.repo_root,
             )
@@ -587,7 +592,7 @@ async def main(args: argparse.Namespace, git_ctx: git.Git) -> int:
         # Build commit message template if --topic was provided
         if args.topic:
             stack[0].commit_msg = await build_commit_template(
-                args.topic, args.relative, commit, git_ctx, topics
+                args.topic, args.relative, args.draft, commit, git_ctx, topics
             )
         else:
             stack[0].commit_msg = ""
