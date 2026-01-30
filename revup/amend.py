@@ -6,6 +6,7 @@ import shlex
 import subprocess
 
 from revup import git, topic_stack
+from revup.topic_stack import RE_TAGS, TAG_RELATIVE
 from revup.types import (
     CommitHeader,
     GitConflictException,
@@ -21,6 +22,68 @@ CLEANUP_SCISSOR_COMMENT = """Do not modify or remove the line above.
 Everything below it will be ignored."""
 CLEANUP_STRIP_COMMENT = """Please enter the commit message for your changes. Lines starting
 with '{}' will be ignored, and an empty message aborts the amend."""
+
+
+def update_relative_in_message(commit_msg: str, new_relative: str) -> Optional[str]:
+    """
+    Update or add a Relative: tag in a commit message.
+
+    Args:
+        commit_msg: The existing commit message
+        new_relative: The new relative topic to set
+
+    Returns:
+        Modified commit message, or None if user cancels the replacement
+    """
+    # Find existing Relative: tag
+    existing_relative = None
+    relative_line_idx = None
+    lines = commit_msg.split("\n")
+
+    for i, line in enumerate(lines):
+        match = RE_TAGS.match(line)
+        if match and match.group("tagname").lower() == TAG_RELATIVE:
+            existing_relative = match.group("tagvalue").strip()
+            relative_line_idx = i
+            break
+
+    # If same value, no change needed
+    if existing_relative == new_relative:
+        logging.info(f"Relative: {new_relative} already set, no change needed.")
+        return commit_msg
+
+    # If different value exists, prompt for confirmation
+    if existing_relative is not None:
+        logging.warning(f"Commit already has 'Relative: {existing_relative}'")
+        confirm = input(f"Replace with 'Relative: {new_relative}'? [y/N]: ").strip().lower()
+        if confirm != "y":
+            logging.info("Aborted. Relative tag not changed.")
+            return None
+        # Replace existing line
+        lines[relative_line_idx] = f"Relative: {new_relative}"
+        return "\n".join(lines)
+
+    # No existing tag - add after Topic: line if present, otherwise at end
+    topic_line_idx = None
+    for i, line in enumerate(lines):
+        match = RE_TAGS.match(line)
+        if match and match.group("tagname").lower() == "topic":
+            topic_line_idx = i
+            break
+
+    new_line = f"Relative: {new_relative}"
+    if topic_line_idx is not None:
+        # Insert after Topic: line
+        lines.insert(topic_line_idx + 1, new_line)
+    else:
+        # Append to end (but before any trailing empty lines)
+        # Find last non-empty line
+        last_content_idx = len(lines) - 1
+        while last_content_idx >= 0 and not lines[last_content_idx].strip():
+            last_content_idx -= 1
+        lines.insert(last_content_idx + 1, new_line)
+
+    return "\n".join(lines)
 
 
 async def invoke_editor_for_commit_msg(
@@ -131,28 +194,46 @@ async def parse_ref_or_topic(
 
 async def build_commit_template(
     topic_name: str,
-    include_relative: bool,
+    relative: bool | str,
     include_draft: bool,
     commit: str,
     git_ctx: git.Git,
     topics: topic_stack.TopicStack,
 ) -> str:
-    """Build commit message template with Topic: and optionally Relative:/Label: tags."""
+    """Build commit message template with Topic: and optionally Relative:/Label: tags.
+
+    Args:
+        topic_name: The topic name for the new commit
+        relative: False to skip, True to auto-detect, or a string topic name to use explicitly
+        include_draft: Whether to add Label: draft
+        commit: The commit being inserted after (used for auto-detection)
+        git_ctx: Git context
+        topics: Topic stack for looking up topics
+    """
     template_lines = ["Feature: <feature description>", "", f"Topic: {topic_name}"]
 
-    if include_relative:
+    if relative:
         await topics.populate_topics()
-        commit_id = await git_ctx.git_stdout("rev-parse", commit)
+        if isinstance(relative, str):
+            # Explicit topic name provided - validate it exists
+            if relative not in topics.topics:
+                available = ", ".join(topics.topics.keys()) if topics.topics else "(none found)"
+                raise RevupUsageException(
+                    f"Relative topic '{relative}' not found.\nAvailable topics: {available}"
+                )
+            template_lines.append(f"Relative: {relative}")
+        else:
+            # Auto-detect from the commit being inserted after
+            commit_id = await git_ctx.git_stdout("rev-parse", commit)
 
-        # Find topic containing the commit we're inserting after
-        for topic in topics.topics.values():
-            for c in topic.original_commits:
-                if c.commit_id == commit_id:
-                    template_lines.append(f"Relative: {topic.name}")
-                    break
-            else:
-                continue
-            break
+            for topic in topics.topics.values():
+                for c in topic.original_commits:
+                    if c.commit_id == commit_id:
+                        template_lines.append(f"Relative: {topic.name}")
+                        break
+                else:
+                    continue
+                break
 
     if include_draft:
         template_lines.append("Label: draft")
@@ -184,12 +265,13 @@ async def main(args: argparse.Namespace, git_ctx: git.Git) -> int:
     if args.drop and args.insert:
         raise RevupUsageException("Doesn't make sense to drop and insert")
 
-    # --topic and --relative only work with 'commit' command, not 'amend'
-    if (args.topic or args.relative) and args.cmd != "commit":
-        raise RevupUsageException("--topic and --relative are only valid for 'revup commit'")
+    # --topic only works with 'commit' command, not 'amend'
+    if args.topic and args.cmd != "commit":
+        raise RevupUsageException("--topic is only valid for 'revup commit'")
 
-    if args.relative and not args.topic:
-        raise RevupUsageException("--relative requires --topic")
+    # For 'commit', --relative requires --topic
+    if args.cmd == "commit" and args.relative and not args.topic:
+        raise RevupUsageException("--relative requires --topic for 'revup commit'")
 
     if has_unstaged:
         await git_ctx.git("add", "--update")
@@ -242,6 +324,30 @@ async def main(args: argparse.Namespace, git_ctx: git.Git) -> int:
             )
         else:
             stack[0].commit_msg = ""
+
+    # Handle --relative for amend command (not insert/commit)
+    if args.relative and not args.insert:
+        relative_topic = args.relative if isinstance(args.relative, str) else None
+
+        if relative_topic is None:
+            raise RevupUsageException(
+                "--relative requires an explicit topic name for 'revup amend'\n"
+                "Usage: revup amend --relative OTHER_TOPIC TOPIC_TO_AMEND"
+            )
+
+        # Validate relative topic exists
+        await topics.populate_topics()
+        if relative_topic not in topics.topics:
+            available = ", ".join(topics.topics.keys()) if topics.topics else "(none found)"
+            raise RevupUsageException(
+                f"Relative topic '{relative_topic}' not found.\nAvailable topics: {available}"
+            )
+
+        # Update the commit message with the new relative tag
+        updated_msg = update_relative_in_message(stack[0].commit_msg, relative_topic)
+        if updated_msg is None:
+            return 1  # User cancelled
+        stack[0].commit_msg = updated_msg
 
     if args.edit and not args.drop:
         new_msg = await invoke_editor_for_commit_msg(

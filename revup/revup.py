@@ -281,7 +281,8 @@ def create_parsers() -> Tuple[RevupArgParser, List[RevupArgParser]]:
     amend_parser.add_argument("--parse-refs", default=True, action="store_true")
     amend_parser.add_argument("--topic", "-t", help="Pre-fill commit message with Topic: tag")
     amend_parser.add_argument(
-        "--relative", "-r", action="store_true", help="Also add Relative: tag (requires --topic)"
+        "--relative", "-r", nargs="?", const=True, default=False,
+        help="Add Relative: tag. Auto-detects if no topic given, or specify explicitly."
     )
     amend_parser.add_argument(
         "--draft", action="store_true", help="Add Label: draft tag (requires --topic)"
