@@ -1,9 +1,11 @@
 import argparse
 import asyncio
 import logging
+import os
 import re
 import shlex
 import subprocess
+from typing import List, Optional
 
 from revup import git, topic_stack
 from revup.topic_stack import RE_TAGS, TAG_RELATIVE
@@ -22,6 +24,92 @@ CLEANUP_SCISSOR_COMMENT = """Do not modify or remove the line above.
 Everything below it will be ignored."""
 CLEANUP_STRIP_COMMENT = """Please enter the commit message for your changes. Lines starting
 with '{}' will be ignored, and an empty message aborts the amend."""
+
+
+async def get_staged_files(git_ctx: git.Git) -> List[str]:
+    """Get list of staged file paths."""
+    output = await git_ctx.git_stdout("diff", "--cached", "--name-only")
+    return [f for f in output.strip().split("\n") if f]
+
+
+def run_commit_message_script(
+    script_path: str,
+    topic: str,
+    relative: bool | str,
+    draft: bool,
+    commit_type: Optional[str],
+    scope: Optional[str],
+    staged_files: List[str],
+    repo_root: str,
+) -> Optional[str]:
+    """
+    Run custom commit message script, return message or None on failure.
+
+    Args:
+        script_path: Path to script (absolute or relative to repo_root)
+        topic: Topic name for the commit
+        relative: False, True (auto-detect), or explicit topic name
+        draft: Whether to mark as draft
+        commit_type: Conventional commit type (feat, fix, etc.)
+        scope: Conventional commit scope
+        staged_files: List of staged file paths
+        repo_root: Repository root path
+
+    Returns:
+        Commit message string on success, None on failure (to fall back to template)
+    """
+    # Resolve script path
+    if not os.path.isabs(script_path):
+        script_path = os.path.join(repo_root, script_path)
+
+    if not os.path.isfile(script_path):
+        logging.debug(f"Commit message script not found: {script_path}")
+        return None
+
+    # Build command arguments
+    cmd = [script_path, "--topic", topic]
+
+    if relative:
+        if isinstance(relative, str):
+            cmd.extend(["--relative", relative])
+        else:
+            cmd.append("--relative")
+
+    if draft:
+        cmd.append("--draft")
+
+    if commit_type:
+        cmd.extend(["--type", commit_type])
+
+    if scope:
+        cmd.extend(["--scope", scope])
+
+    # Add file list after --
+    if staged_files:
+        cmd.append("--")
+        cmd.extend(staged_files)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            message = result.stdout.strip()
+            if message:
+                return message
+            logging.warning("Commit message script returned empty output, using template")
+            return None
+        else:
+            logging.debug(f"Commit message script failed with code {result.returncode}")
+            if result.stderr:
+                logging.debug(f"Script stderr: {result.stderr}")
+            return None
+    except Exception as e:
+        logging.debug(f"Failed to run commit message script: {e}")
+        return None
 
 
 def update_relative_in_message(commit_msg: str, new_relative: str) -> Optional[str]:
@@ -319,9 +407,29 @@ async def main(args: argparse.Namespace, git_ctx: git.Git) -> int:
 
         # Build commit message template if --topic was provided
         if args.topic:
-            stack[0].commit_msg = await build_commit_template(
-                args.topic, args.relative, args.draft, commit, git_ctx, topics
-            )
+            commit_msg = None
+
+            # Try custom script first if configured
+            if args.commit_message_script:
+                staged_files = await get_staged_files(git_ctx)
+                commit_msg = run_commit_message_script(
+                    script_path=args.commit_message_script,
+                    topic=args.topic,
+                    relative=args.relative,
+                    draft=args.draft,
+                    commit_type=getattr(args, "type", None),
+                    scope=getattr(args, "scope", None),
+                    staged_files=staged_files,
+                    repo_root=git_ctx.repo_root,
+                )
+
+            # Fall back to built-in template
+            if commit_msg is None:
+                commit_msg = await build_commit_template(
+                    args.topic, args.relative, args.draft, commit, git_ctx, topics
+                )
+
+            stack[0].commit_msg = commit_msg
         else:
             stack[0].commit_msg = ""
 
