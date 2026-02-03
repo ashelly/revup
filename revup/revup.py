@@ -253,6 +253,13 @@ async def main() -> int:
     upload_parser.add_argument("--head", default="HEAD")
 
     restack_parser.add_argument("--topicless-last", "-t", action="store_true")
+    restack_parser.add_argument(
+        "--as",
+        nargs="+",
+        dest="reorder_topics",
+        metavar="TOPIC",
+        help="Reorder specified topics into a chain, updating Relative: tags",
+    )
 
     amend_parser.add_argument("ref_or_topic", nargs="?")
     amend_parser.add_argument("--edit", "-s", default=True, action="store_true")

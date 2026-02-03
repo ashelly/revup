@@ -6,7 +6,7 @@ revup restack - Reorder commits to group topics together.
 
 `revup [--verbose] [--keep-temp]`
 : `restack [--help] [--base-branch=<base>] [--num-commits=<N>]`
-`[--relative-chain]`
+`[--relative-chain] [--as <topic> [<topic> ...]]`
 
 # DESCRIPTION
 
@@ -48,3 +48,25 @@ tags when you know all reviews in the stack will be dependent.
 **--topicless-last, -t**
 : Apply all topicless commits last (at the top of the commit stack) instead
 of first.
+
+**--as <topic> [<topic> ...]**
+: Reorder the specified topics into a chain before restacking. The first
+topic in the list keeps its current ancestor (or becomes relative to the
+base branch if all its ancestors are in the list). Each subsequent topic
+becomes relative to the previous topic in the list.
+
+For example, if you have topics `a <- b <- c` (c relative to b, b relative
+to a) and run `restack --as c b`, the result will be `a <- c <- b` (b
+relative to c, c relative to a).
+
+This is useful for reordering dependent reviews without manually editing
+the `Relative:` tags in each commit. Topics not in the list are unaffected,
+though they may end up branching off if their relative was reordered.
+
+Examples:
+
+: `revup restack --as feature_b feature_a`
+: Swap the order of two topics, making feature_a relative to feature_b.
+
+: `revup restack --as topic_c topic_b topic_a`
+: Reverse the order of three topics in a chain.
