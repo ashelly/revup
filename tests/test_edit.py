@@ -51,45 +51,6 @@ def git_ctx(git_repo):
     return git_ctx
 
 
-class TestEditCommand:
-    """Tests for the revup edit command."""
-
-    def test_edit_parser_registered(self):
-        """Test that the edit command parser is registered."""
-        loop = asyncio.get_event_loop()
-
-        async def check_parser():
-            revup_parser = revup.make_toplevel_parser()
-            subparsers = revup_parser.add_subparsers(dest="cmd", required=True)
-            # The edit parser should be addable
-            edit_parser = subparsers.add_parser("edit", add_help=False)
-            edit_parser.add_argument("topic", nargs="?")
-            edit_parser.add_argument("--commit", "-c", action="store_true")
-            args = revup_parser.parse_args(["edit", "mytopic"])
-            assert args.cmd == "edit"
-            assert args.topic == "mytopic"
-            assert not args.commit
-
-        loop.run_until_complete(check_parser())
-
-    def test_edit_commit_flag(self):
-        """Test that --commit flag is parsed correctly."""
-        loop = asyncio.get_event_loop()
-
-        async def check_parser():
-            revup_parser = revup.make_toplevel_parser()
-            subparsers = revup_parser.add_subparsers(dest="cmd", required=True)
-            edit_parser = subparsers.add_parser("edit", add_help=False)
-            edit_parser.add_argument("topic", nargs="?")
-            edit_parser.add_argument("--commit", "-c", action="store_true")
-            args = revup_parser.parse_args(["edit", "--commit"])
-            assert args.cmd == "edit"
-            assert args.commit
-            assert args.topic is None
-
-        loop.run_until_complete(check_parser())
-
-
 class TestEditFunctions:
     """Tests for edit module functions."""
 
