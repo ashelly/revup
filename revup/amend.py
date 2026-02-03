@@ -8,8 +8,8 @@ import subprocess
 from typing import Optional
 
 from revup import git, topic_stack
-from revup.relative_utils import update_relative_in_message
-from revup.topic_stack import RE_TAGS, TAG_RELATIVE
+from revup.relative_utils import update_relative_in_message, update_topic_relative_in_stack
+from revup.topic_stack import RE_TAGS, TAG_RELATIVE, is_ancestor
 from revup.types import (
     CommitHeader,
     GitConflictException,
@@ -265,6 +265,247 @@ async def build_commit_template(
     return "\n".join(template_lines)
 
 
+def validate_amend_arguments(args: argparse.Namespace) -> None:
+    """Validate argument combinations for amend/commit commands."""
+    if args.drop and args.insert:
+        raise RevupUsageException("Doesn't make sense to drop and insert")
+    if args.topic and args.cmd != "commit":
+        raise RevupUsageException("--topic is only valid for 'revup commit'")
+    if args.cmd == "commit" and args.relative and not args.topic:
+        raise RevupUsageException("--relative requires --topic for 'revup commit'")
+
+
+async def resolve_target_commit(
+    args: argparse.Namespace, git_ctx: git.Git, topics: topic_stack.TopicStack
+) -> str:
+    """Resolve ref_or_topic to commit hash, or return HEAD if not specified."""
+    if not args.ref_or_topic:
+        return "HEAD"
+    commit = await parse_ref_or_topic(args.ref_or_topic, args, git_ctx, topics)
+    if not await git_ctx.is_ancestor(f"{commit}~", "HEAD"):
+        raise RevupUsageException(
+            "Specified commit is not a first parent ancestor of HEAD"
+            if commit == args.ref_or_topic
+            else (
+                f"Commit ({commit}, from topic {args.ref_or_topic}) is not a first parent"
+                " ancestor of HEAD"
+            )
+        )
+    return commit
+
+
+async def get_commit_stack(git_ctx: git.Git, commit: str) -> list[CommitHeader]:
+    """Get the stack of commits from HEAD to the target commit."""
+    stack = git.parse_rev_list(
+        await git_ctx.rev_list(
+            "HEAD", f"{commit}~", header=True, first_parent=True, exclude_first_parent=True
+        )
+    )
+    if len(stack) == 0:
+        raise RevupUsageException(f"Couldn't find any commits between HEAD and {commit}~")
+    return stack
+
+
+async def prepare_insert_commit(
+    args: argparse.Namespace, git_ctx: git.Git, topics: topic_stack.TopicStack,
+    stack: list[CommitHeader], commit: str
+) -> None:
+    """Prepare stack[0] for inserting a new commit."""
+    stack[0].parents = [stack[0].commit_id]
+    stack[0].author_name = stack[0].author_email = stack[0].author_date = ""
+    stack[0].committer_name = stack[0].committer_email = stack[0].committer_date = ""
+
+    if args.topic:
+        commit_msg = None
+        if args.commit_message_script:
+            staged_files = await get_staged_files(git_ctx)
+            commit_msg = run_commit_message_script(
+                script_path=args.commit_message_script, topic=args.topic,
+                relative=args.relative,
+                commit_type=getattr(args, "type", None), scope=getattr(args, "scope", None),
+                staged_files=staged_files, repo_root=git_ctx.repo_root,
+            )
+        if commit_msg is None:
+            commit_msg = await build_commit_template(
+                args.topic, args.relative, args.draft, commit, git_ctx, topics
+            )
+        stack[0].commit_msg = commit_msg
+    else:
+        stack[0].commit_msg = ""
+
+
+def validate_relative_topic_name(args: argparse.Namespace) -> str:
+    """Extract and validate relative topic name from args."""
+    relative_topic = args.relative if isinstance(args.relative, str) else None
+    if relative_topic is None:
+        raise RevupUsageException(
+            "--relative requires an explicit topic name for 'revup amend'\n"
+            "Usage: revup amend --relative OTHER_TOPIC TOPIC_TO_AMEND"
+        )
+    return relative_topic
+
+
+async def validate_relative_topic_exists(
+    relative_topic: str, topics: topic_stack.TopicStack
+) -> None:
+    """Ensure the relative topic exists in the topic stack."""
+    await topics.populate_topics()
+    if relative_topic not in topics.topics:
+        available = ", ".join(topics.topics.keys()) if topics.topics else "(none found)"
+        raise RevupUsageException(
+            f"Relative topic '{relative_topic}' not found.\nAvailable topics: {available}"
+        )
+
+
+def find_topic_for_commit(
+    commit: str, topics: topic_stack.TopicStack
+) -> Optional[topic_stack.Topic]:
+    """Find which topic contains the given commit."""
+    for t in topics.topics.values():
+        if any(c.commit_id == commit for c in t.original_commits):
+            return t
+    return None
+
+
+async def extract_descendant_from_chain(
+    target_topic: topic_stack.Topic, new_relative_topic: topic_stack.Topic,
+    git_ctx: git.Git, stack: list[CommitHeader]
+) -> None:
+    """Extract a descendant topic from the chain to prevent cycles.
+    
+    When setting A's relative to B, but B is currently below A in the chain,
+    we first need to "extract" B by setting B's relative to A's current relative.
+    """
+    gca = target_topic.relative_topic
+    logging.info(
+        f"Extracting '{new_relative_topic.name}' from below '{target_topic.name}' "
+        f"(setting its relative to '{gca.name if gca else 'base branch'}')"
+    )
+    if not update_topic_relative_in_stack(new_relative_topic, gca, stack, prompt=False):
+        return
+    # Rewrite commits with updated messages
+    new_commit = stack[0].parents[0]
+    for i, commit_obj in enumerate(stack):
+        if i == len(stack) - 1:
+            break
+        tree = commit_obj.tree if commit_obj.tree else GitTreeHash(
+            await git_ctx.git_stdout("rev-parse", f"{commit_obj.commit_id}^{{tree}}")
+        )
+        new_commit = await git_ctx.synthetic_amend(tree, commit_obj.commit_msg, new_commit)
+    await git_ctx.git(
+        "reset", "--soft", new_commit,
+        env={"GIT_REFLOG_ACTION": "reset --soft (revup amend --relative extraction)"},
+    )
+    # Re-read the stack with updated commit messages
+    new_stack = git.parse_rev_list(
+        await git_ctx.rev_list(
+            "HEAD", f"{new_commit}~{len(stack)}", header=True,
+            first_parent=True, exclude_first_parent=True
+        )
+    )
+    stack[:] = new_stack
+
+
+async def handle_relative_update(
+    args: argparse.Namespace, git_ctx: git.Git, topics: topic_stack.TopicStack,
+    stack: list[CommitHeader], commit: str
+) -> bool:
+    """Update Relative: tag in target commit. Returns True if message changed."""
+    relative_topic = validate_relative_topic_name(args)
+    await validate_relative_topic_exists(relative_topic, topics)
+
+    target_topic = find_topic_for_commit(commit, topics)
+    new_relative_topic = topics.topics[relative_topic]
+
+    # Prevent cycles: if new relative is below target, extract it first
+    if target_topic and is_ancestor(target_topic, new_relative_topic):
+        await extract_descendant_from_chain(target_topic, new_relative_topic, git_ctx, stack)
+
+    original_msg = stack[0].commit_msg
+    updated_msg = update_relative_in_message(stack[0].commit_msg, relative_topic)
+    if updated_msg is None:
+        raise RevupUsageException("User cancelled relative tag update")
+    stack[0].commit_msg = updated_msg
+    return updated_msg != original_msg
+
+
+async def edit_commit_message(
+    args: argparse.Namespace, git_ctx: git.Git, topics: topic_stack.TopicStack,
+    stack: list[CommitHeader], commit: str, has_diff: bool
+) -> Optional[str]:
+    """Open editor for commit message. Returns new message or None if empty."""
+    new_msg = await invoke_editor_for_commit_msg(
+        git_ctx, git_ctx.editor,
+        await get_topic_summary(topics) if args.parse_topics else "",
+        stack[0].commit_msg,
+        (await git_ctx.git_stdout("--no-pager", "diff", "--cached", "--stat", "--no-color")
+         if has_diff else ""),
+        ("" if args.insert else await git_ctx.git_stdout(
+            "--no-pager", "diff", commit + "~", commit, "--stat", "--no-color")),
+    )
+    return new_msg if new_msg.strip() else None
+
+
+async def rewrite_commits_with_diff(
+    args: argparse.Namespace, git_ctx: git.Git, stack: list[CommitHeader]
+) -> str:
+    """Rewrite commits when there are staged changes. Returns new HEAD hash."""
+    new_commit = stack[0].parents[0]
+    if not args.drop:
+        stack[-1].tree = GitTreeHash(await git_ctx.git_stdout("write-tree"))
+
+    for i, commit_obj in enumerate(stack):
+        if i == 0 and args.drop:
+            continue
+        elif i == 0 and len(stack) > 1:
+            # Amend the first commit with cached changes
+            temp_commit = CommitHeader(stack[-1].tree, [git.HEAD_COMMIT])
+            temp_commit.title = temp_commit.commit_msg = "cached changes"
+            temp_commit.commit_id = await git_ctx.commit_tree(temp_commit)
+            stack[-1].tree = temp_commit.tree
+            try:
+                new_commit = await git_ctx.synthetic_amend(commit_obj, temp_commit)
+            except GitConflictException as exc:
+                await git_ctx.dump_conflict(exc)
+                raise RevupConflictException(
+                    temp_commit, commit_obj.commit_id,
+                    "You may need to `git rebase -i` to resolve these conflicts!",
+                ) from exc
+        else:
+            if i == len(stack) - 1 and not args.drop:
+                new_commit = await git_ctx.cherry_pick_from_tree(commit_obj, new_commit)
+            else:
+                try:
+                    new_commit = await git_ctx.synthetic_cherry_pick_from_commit(
+                        commit_obj, new_commit)
+                except GitConflictException as exc:
+                    await git_ctx.dump_conflict(exc)
+                    raise RevupConflictException(
+                        commit_obj, new_commit,
+                        "You may need to `git rebase -i` to resolve these conflicts!",
+                    ) from exc
+    return new_commit
+
+
+async def rewrite_commits_message_only(git_ctx: git.Git, stack: list[CommitHeader]) -> str:
+    """Rewrite commits when only the message changed (faster, reuses trees)."""
+    new_commit = stack[0].parents[0]
+    for stack_entry in stack:
+        new_commit = await git_ctx.cherry_pick_from_tree(stack_entry, new_commit)
+    return new_commit
+
+
+async def finalize_amend(
+    git_ctx: git.Git, stack: list[CommitHeader], new_commit: str, args: argparse.Namespace
+) -> None:
+    """Perform final soft reset and update reflog."""
+    reflog_action_str = 'revup amend {}{}: "{}"'.format(
+        "--drop " if args.drop else "--insert " if args.insert else "",
+        stack[0].commit_id[:8], stack[0].commit_msg.splitlines()[0][:40],
+    )
+    await git_ctx.soft_reset(new_commit, {"GIT_REFLOG_ACTION": reflog_action_str})
+
+
 async def main(args: argparse.Namespace, git_ctx: git.Git) -> int:
     """
     Amend the given commit and recreate the history on top of that commit to make
@@ -354,29 +595,14 @@ async def main(args: argparse.Namespace, git_ctx: git.Git) -> int:
     # Track if --relative changed the message to prevent incorrect early return
     relative_changed_msg = False
     if args.relative and not args.insert:
-        relative_topic = args.relative if isinstance(args.relative, str) else None
-
-        if relative_topic is None:
-            raise RevupUsageException(
-                "--relative requires an explicit topic name for 'revup amend'\n"
-                "Usage: revup amend --relative OTHER_TOPIC TOPIC_TO_AMEND"
+        try:
+            relative_changed_msg = await handle_relative_update(
+                args, git_ctx, topics, stack, commit
             )
-
-        # Validate relative topic exists
-        await topics.populate_topics()
-        if relative_topic not in topics.topics:
-            available = ", ".join(topics.topics.keys()) if topics.topics else "(none found)"
-            raise RevupUsageException(
-                f"Relative topic '{relative_topic}' not found.\nAvailable topics: {available}"
-            )
-
-        # Update the commit message with the new relative tag
-        original_msg = stack[0].commit_msg
-        updated_msg = update_relative_in_message(stack[0].commit_msg, relative_topic)
-        if updated_msg is None:
-            return 1  # User cancelled
-        stack[0].commit_msg = updated_msg
-        relative_changed_msg = (updated_msg != original_msg)
+        except RevupUsageException as e:
+            if "User cancelled" in str(e):
+                return 1
+            raise
 
     if args.edit and not args.drop:
         new_msg = await invoke_editor_for_commit_msg(
