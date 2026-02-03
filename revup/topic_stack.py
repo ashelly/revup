@@ -207,6 +207,27 @@ class Topic:
         return depth_first_iter_helper(self, set())
 
 
+def is_ancestor(ancestor: Topic, descendant: Topic) -> bool:
+    """Check if ancestor is in descendant's relative chain.
+
+    Returns True if walking up from descendant's relative_topic eventually
+    reaches ancestor. Used to detect if setting a relative would create a cycle.
+
+    Args:
+        ancestor: The potential ancestor topic
+        descendant: The topic to check ancestry for
+
+    Returns:
+        True if ancestor is in descendant's ancestor chain, False otherwise
+    """
+    current = descendant.relative_topic
+    while current:
+        if current.name == ancestor.name:
+            return True
+        current = current.relative_topic
+    return False
+
+
 @dataclass
 class TopicStack:
     """
