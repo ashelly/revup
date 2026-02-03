@@ -274,6 +274,13 @@ def create_parsers() -> Tuple[RevupArgParser, List[RevupArgParser]]:
     upload_parser.add_argument("--head", default="HEAD")
 
     restack_parser.add_argument("--topicless-last", "-t", action="store_true")
+    restack_parser.add_argument(
+        "--as",
+        nargs="+",
+        dest="reorder_topics",
+        metavar="TOPIC",
+        help="Reorder specified topics into a chain, updating Relative: tags",
+    )
 
     edit_parser.add_argument("topic", nargs="?")
     edit_parser.add_argument("--commit", "-c", action="store_true")
