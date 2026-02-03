@@ -8,6 +8,7 @@ import subprocess
 from typing import Optional
 
 from revup import git, topic_stack
+from revup.relative_utils import update_relative_in_message
 from revup.topic_stack import RE_TAGS, TAG_RELATIVE
 from revup.types import (
     CommitHeader,
@@ -26,66 +27,92 @@ CLEANUP_STRIP_COMMENT = """Please enter the commit message for your changes. Lin
 with '{}' will be ignored, and an empty message aborts the amend."""
 
 
-def update_relative_in_message(commit_msg: str, new_relative: str) -> Optional[str]:
+async def get_staged_files(git_ctx: git.Git) -> list[str]:
+    """Get list of staged file paths."""
+    output = await git_ctx.git_stdout("diff", "--cached", "--name-only")
+    return [f for f in output.strip().split("\n") if f]
+
+
+def run_commit_message_script(
+    script_path: str,
+    topic: str,
+    relative: bool | str,
+    draft: bool,
+    commit_type: Optional[str],
+    scope: Optional[str],
+    staged_files: list[str],
+    repo_root: str,
+) -> Optional[str]:
     """
-    Update or add a Relative: tag in a commit message.
+    Run custom commit message script, return message or None on failure.
 
     Args:
-        commit_msg: The existing commit message
-        new_relative: The new relative topic to set
+        script_path: Path to script (absolute or relative to repo_root)
+        topic: Topic name for the commit
+        relative: False, True (auto-detect), or explicit topic name
+        draft: Whether to mark as draft
+        commit_type: Conventional commit type (feat, fix, etc.)
+        scope: Conventional commit scope
+        staged_files: list of staged file paths
+        repo_root: Repository root path
 
     Returns:
-        Modified commit message, or None if user cancels the replacement
+        Commit message string on success, None on failure (to fall back to template)
     """
-    # Find existing Relative: tag
-    existing_relative = None
-    relative_line_idx = None
-    lines = commit_msg.split("\n")
+    # Resolve script path
+    if not os.path.isabs(script_path):
+        script_path = os.path.join(repo_root, script_path)
 
-    for i, line in enumerate(lines):
-        match = RE_TAGS.match(line)
-        if match and match.group("tagname").lower() == TAG_RELATIVE:
-            existing_relative = match.group("tagvalue").strip()
-            relative_line_idx = i
-            break
+    if not os.path.isfile(script_path):
+        logging.debug(f"Commit message script not found: {script_path}")
+        return None
 
-    # If same value, no change needed
-    if existing_relative == new_relative:
-        logging.info(f"Relative: {new_relative} already set, no change needed.")
-        return commit_msg
+    # Build command arguments
+    cmd = [script_path, "--topic", topic]
 
-    # If different value exists, prompt for confirmation
-    if existing_relative is not None:
-        logging.warning(f"Commit already has 'Relative: {existing_relative}'")
-        confirm = input(f"Replace with 'Relative: {new_relative}'? [y/N]: ").strip().lower()
-        if confirm != "y":
-            logging.info("Aborted. Relative tag not changed.")
+    if relative:
+        if isinstance(relative, str):
+            cmd.extend(["--relative", relative])
+        else:
+            cmd.append("--relative")
+
+    if draft:
+        cmd.append("--draft")
+
+    if commit_type:
+        cmd.extend(["--type", commit_type])
+
+    if scope:
+        cmd.extend(["--scope", scope])
+
+    # Add file list after --
+    if staged_files:
+        cmd.append("--")
+        cmd.extend(staged_files)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            message = result.stdout.strip()
+            if message:
+                return message
+            logging.warning("Commit message script returned empty output, using template")
             return None
-        # Replace existing line
-        lines[relative_line_idx] = f"Relative: {new_relative}"
-        return "\n".join(lines)
+        else:
+            logging.debug(f"Commit message script failed with code {result.returncode}")
+            if result.stderr:
+                logging.debug(f"Script stderr: {result.stderr}")
+            return None
+    except Exception as e:
+        logging.debug(f"Failed to run commit message script: {e}")
+        return None
 
-    # No existing tag - add after Topic: line if present, otherwise at end
-    topic_line_idx = None
-    for i, line in enumerate(lines):
-        match = RE_TAGS.match(line)
-        if match and match.group("tagname").lower() == "topic":
-            topic_line_idx = i
-            break
 
-    new_line = f"Relative: {new_relative}"
-    if topic_line_idx is not None:
-        # Insert after Topic: line
-        lines.insert(topic_line_idx + 1, new_line)
-    else:
-        # Append to end (but before any trailing empty lines)
-        # Find last non-empty line
-        last_content_idx = len(lines) - 1
-        while last_content_idx >= 0 and not lines[last_content_idx].strip():
-            last_content_idx -= 1
-        lines.insert(last_content_idx + 1, new_line)
-
-    return "\n".join(lines)
 
 
 async def invoke_editor_for_commit_msg(
@@ -256,7 +283,8 @@ async def main(args: argparse.Namespace, git_ctx: git.Git) -> int:
 
     args.edit = args.edit or args.insert
     has_diff = has_staged or has_unstaged or args.drop
-    if not has_diff and not args.edit:
+    # Don't early return if --relative is set, as we need to process the tag update
+    if not has_diff and not args.edit and not args.relative:
         return 0
 
     if args.drop and args.insert:
@@ -323,6 +351,8 @@ async def main(args: argparse.Namespace, git_ctx: git.Git) -> int:
             stack[0].commit_msg = ""
 
     # Handle --relative for amend command (not insert/commit)
+    # Track if --relative changed the message to prevent incorrect early return
+    relative_changed_msg = False
     if args.relative and not args.insert:
         relative_topic = args.relative if isinstance(args.relative, str) else None
 
@@ -341,10 +371,12 @@ async def main(args: argparse.Namespace, git_ctx: git.Git) -> int:
             )
 
         # Update the commit message with the new relative tag
+        original_msg = stack[0].commit_msg
         updated_msg = update_relative_in_message(stack[0].commit_msg, relative_topic)
         if updated_msg is None:
             return 1  # User cancelled
         stack[0].commit_msg = updated_msg
+        relative_changed_msg = (updated_msg != original_msg)
 
     if args.edit and not args.drop:
         new_msg = await invoke_editor_for_commit_msg(
@@ -369,7 +401,9 @@ async def main(args: argparse.Namespace, git_ctx: git.Git) -> int:
             logging.info("Exited due to empty commit message.")
             return 1
 
-        if stack[0].commit_msg == new_msg and not has_diff:
+        # Don't early return if --relative changed the message, as the change
+        # still needs to be persisted to the git commit
+        if stack[0].commit_msg == new_msg and not has_diff and not relative_changed_msg:
             return 0
 
         stack[0].commit_msg = new_msg
