@@ -122,6 +122,12 @@ given branch relative to its base branch, then cherry-pick it.
 **revup toolkit**
 : Various low-level subfunctionalities intended for advanced users or scripts.
 
+**revup completion**
+: Output shell completion scripts. Currently supports bash.
+To enable, run `revup completion bash --install` or manually add to
+your ~/.bashrc: `eval "$(revup completion bash)"`
+
+
 # ISSUES
 
 See https://github.com/Skydio/revup/issues for a list of known issues.
