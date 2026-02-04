@@ -89,6 +89,50 @@ def git_ctx(git_repo):
     return loop.run_until_complete(git.make_git(sh, remote_name="origin", main_branch="main"))
 
 
+class TestBuildCommitTemplate:
+    """Tests for build_commit_template function."""
+
+    def test_draft_label_added_when_true(self, git_repo, git_ctx):
+        """Test that Label: draft is added when include_draft is True."""
+        import asyncio
+        from revup.topic_stack import TopicStack
+
+        async def run_test():
+            topics = TopicStack(git_ctx, "origin/main", "", None, None)
+            result = await amend.build_commit_template(
+                topic_name="mytopic",
+                relative=False,
+                include_draft=True,
+                commit="HEAD",
+                git_ctx=git_ctx,
+                topics=topics,
+            )
+            assert "Label: draft" in result
+            assert "Topic: mytopic" in result
+
+        asyncio.get_event_loop().run_until_complete(run_test())
+
+    def test_draft_label_not_added_when_false(self, git_repo, git_ctx):
+        """Test that Label: draft is NOT added when include_draft is False."""
+        import asyncio
+        from revup.topic_stack import TopicStack
+
+        async def run_test():
+            topics = TopicStack(git_ctx, "origin/main", "", None, None)
+            result = await amend.build_commit_template(
+                topic_name="mytopic",
+                relative=False,
+                include_draft=False,
+                commit="HEAD",
+                git_ctx=git_ctx,
+                topics=topics,
+            )
+            assert "Label: draft" not in result
+            assert "Topic: mytopic" in result
+
+        asyncio.get_event_loop().run_until_complete(run_test())
+
+
 class TestRunCommitMessageScript:
     """Tests for run_commit_message_script function."""
 
