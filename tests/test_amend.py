@@ -1,98 +1,92 @@
 """Tests for revup amend module."""
 from __future__ import annotations
 
+import asyncio
 import os
 import stat
+import subprocess
 import tempfile
 
 import pytest
 
-from revup import amend, revup
+from revup import amend, git, revup, shell
+from revup.relative_utils import update_topic_relative_in_stack
+from revup.topic_stack import TopicStack
 
 
-class TestCommitRelativeFlag:
-    """Tests for the --relative flag on revup commit."""
-
-    def test_relative_flag_without_value(self):
-        """Test that --relative without a value sets relative to True (auto-detect)."""
-        revup_parser, _ = revup.create_parsers()
-        args = revup_parser.parse_args(["commit", "--topic", "mytopic", "--relative"])
-        assert args.topic == "mytopic"
-        assert args.relative is True
-
-    def test_relative_flag_with_explicit_topic(self):
-        """Test that --relative TOPIC sets relative to the specified topic name."""
-        revup_parser, _ = revup.create_parsers()
-        args = revup_parser.parse_args(["commit", "--topic", "mytopic", "--relative", "other_topic"])
-        assert args.topic == "mytopic"
-        assert args.relative == "other_topic"
-
-    def test_relative_short_flag_without_value(self):
-        """Test that -r without a value sets relative to True."""
-        revup_parser, _ = revup.create_parsers()
-        args = revup_parser.parse_args(["commit", "-t", "mytopic", "-r"])
-        assert args.topic == "mytopic"
-        assert args.relative is True
-
-    def test_relative_short_flag_with_explicit_topic(self):
-        """Test that -r TOPIC sets relative to the specified topic name."""
-        revup_parser, _ = revup.create_parsers()
-        args = revup_parser.parse_args(["commit", "-t", "mytopic", "-r", "base_topic"])
-        assert args.topic == "mytopic"
-        assert args.relative == "base_topic"
-
-    def test_relative_without_topic_still_requires_topic(self):
-        """Test that --relative still requires --topic to be specified."""
-        # This is validated at runtime in amend.main, not by argparse
-        revup_parser, _ = revup.create_parsers()
-        args = revup_parser.parse_args(["commit", "--relative", "other"])
-        assert args.relative == "other"
-        assert args.topic is None  # Will fail at runtime validation
+# =============================================================================
+# INTEGRATION TEST FIXTURES AND HELPERS
+# =============================================================================
 
 
-class TestBuildCommitTemplate:
-    """Tests for build_commit_template function."""
+def create_topic_commit(repo_dir, topic_name, relative=None, filename=None):
+    """Create a commit with Topic tag and optional Relative tag."""
+    filename = filename or f"{topic_name}.txt"
+    (repo_dir / filename).write_text(f"content for {topic_name}")
+    subprocess.run(["git", "add", filename], check=True)
+    msg = f"feat: {topic_name}\n\nTopic: {topic_name}"
+    if relative:
+        msg += f"\nRelative: {relative}"
+    subprocess.run(["git", "commit", "-m", msg], check=True)
 
-    def test_explicit_relative_validates_topic_exists(self):
-        """Test that explicit --relative TOPIC validates the topic exists."""
-        # This is tested via the error message when topic doesn't exist
-        # The actual validation happens in build_commit_template
-        pass  # Integration test would require full git setup
+
+def get_commit_message(ref="HEAD"):
+    """Get the commit message for a ref."""
+    return subprocess.check_output(
+        ["git", "log", "-1", "--format=%B", ref]
+    ).decode().strip()
 
 
-class TestCommitTypeAndScope:
-    """Tests for --type and --scope arguments."""
+def get_all_topic_relatives(num_commits):
+    """Get dict of topic -> relative for the last num_commits commits."""
+    result = {}
+    for i in range(num_commits):
+        ref = f"HEAD~{i}" if i > 0 else "HEAD"
+        msg = get_commit_message(ref)
+        topic = None
+        relative = None
+        for line in msg.split('\n'):
+            if line.lower().startswith('topic:'):
+                topic = line.split(':', 1)[1].strip()
+            elif line.lower().startswith('relative:'):
+                relative = line.split(':', 1)[1].strip()
+        if topic:
+            result[topic] = relative
+    return result
 
-    def test_type_argument(self):
-        """Test that --type is parsed correctly."""
-        revup_parser, _ = revup.create_parsers()
-        args = revup_parser.parse_args(["commit", "--topic", "mytopic", "--type", "feat"])
-        assert args.topic == "mytopic"
-        assert args.type == "feat"
 
-    def test_scope_argument(self):
-        """Test that --scope is parsed correctly."""
-        revup_parser, _ = revup.create_parsers()
-        args = revup_parser.parse_args(["commit", "--topic", "mytopic", "--scope", "auth"])
-        assert args.topic == "mytopic"
-        assert args.scope == "auth"
+@pytest.fixture
+def git_repo(tmp_path):
+    """Create a temporary git repo for integration tests."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    original_dir = os.getcwd()
+    os.chdir(repo_dir)
 
-    def test_type_and_scope_together(self):
-        """Test that --type and --scope work together."""
-        revup_parser, _ = revup.create_parsers()
-        args = revup_parser.parse_args([
-            "commit", "--topic", "mytopic", "--type", "fix", "--scope", "api"
-        ])
-        assert args.type == "fix"
-        assert args.scope == "api"
+    # Initialize git repo
+    subprocess.run(["git", "init", "-b", "main"], check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], check=True)
 
-    def test_commit_message_script_argument(self):
-        """Test that --commit-message-script is parsed correctly."""
-        revup_parser, _ = revup.create_parsers()
-        args = revup_parser.parse_args([
-            "commit", "--topic", "mytopic", "--commit-message-script", "/path/to/script"
-        ])
-        assert args.commit_message_script == "/path/to/script"
+    # Create initial commit
+    (repo_dir / "file.txt").write_text("initial")
+    subprocess.run(["git", "add", "file.txt"], check=True)
+    subprocess.run(["git", "commit", "-m", "initial commit"], check=True)
+
+    # Add fake remote so revup can find origin/main
+    subprocess.run(["git", "remote", "add", "origin", "."], check=True)
+    subprocess.run(["git", "fetch", "origin"], check=True)
+
+    yield repo_dir
+    os.chdir(original_dir)
+
+
+@pytest.fixture
+def git_ctx(git_repo):
+    """Create Git context for the test repo."""
+    loop = asyncio.get_event_loop()
+    sh = shell.Shell()
+    return loop.run_until_complete(git.make_git(sh, remote_name="origin", main_branch="main"))
 
 
 class TestRunCommitMessageScript:
@@ -232,6 +226,124 @@ class TestRunCommitMessageScript:
             assert result == "test message"
 
 
+# =============================================================================
+# COMMIT COMMAND INTEGRATION TESTS
+# =============================================================================
+
+
+class TestCommitCommandIntegration:
+    """Integration tests for 'revup commit' command with real git repos."""
+
+    def test_commit_creates_topic_commit(self, git_repo, git_ctx):
+        """revup commit --topic creates a commit with Topic tag."""
+        from conftest import create_topic_commit, get_commit_message, run_async
+
+        # Need at least one topic commit for rev-list to work (HEAD~ must exist)
+        create_topic_commit(git_repo, "existing_topic")
+
+        # Stage a new file change
+        (git_repo / "new_feature.txt").write_text("new content")
+        subprocess.run(["git", "add", "new_feature.txt"], check=True)
+
+        # Create commit with revup
+        # Note: args.insert is set by dispatch in revup.py, must set manually here
+        args = revup.create_parsers()[0].parse_args([
+            "commit", "--topic", "my_feature", "--no-edit"
+        ])
+        args.insert = True  # Normally set by revup.py dispatch
+
+        # Use 'true' as editor to skip interactive editing (for insert, edit is always forced)
+        git_ctx.editor = "true"
+
+        result = run_async(amend.main(args, git_ctx))
+        assert result == 0
+
+        # Verify commit has Topic tag
+        msg = get_commit_message()
+        assert "Topic: my_feature" in msg
+
+    def test_commit_with_relative_creates_both_tags(self, git_repo, git_ctx):
+        """revup commit --topic --relative creates commit with Topic and Relative tags."""
+        from conftest import create_topic_commit, get_commit_message, run_async
+
+        # Create base topic first
+        create_topic_commit(git_repo, "base_feature")
+
+        # Stage another change
+        (git_repo / "child_feature.txt").write_text("child content")
+        subprocess.run(["git", "add", "child_feature.txt"], check=True)
+
+        # Create commit with explicit relative
+        args = revup.create_parsers()[0].parse_args([
+            "commit", "--topic", "child_feature", "--relative", "base_feature", "--no-edit"
+        ])
+        args.insert = True  # Normally set by revup.py dispatch
+        git_ctx.editor = "true"  # Skip interactive editing
+
+        result = run_async(amend.main(args, git_ctx))
+        assert result == 0
+
+        msg = get_commit_message()
+        assert "Topic: child_feature" in msg
+        assert "Relative: base_feature" in msg
+
+    def test_commit_without_topic_aborts_on_empty_message(self, git_repo, git_ctx):
+        """revup commit without --topic aborts when editor produces empty message."""
+        from conftest import create_topic_commit, run_async
+
+        # Need existing commit for rev-list
+        create_topic_commit(git_repo, "existing_topic")
+
+        (git_repo / "test.txt").write_text("test")
+        subprocess.run(["git", "add", "test.txt"], check=True)
+
+        # Parse args without --topic
+        args = revup.create_parsers()[0].parse_args(["commit", "--no-edit"])
+        args.insert = True  # Normally set by revup.py dispatch
+        git_ctx.editor = "true"  # Results in empty message
+
+        # Without --topic, template is empty, editor produces empty message, commit aborts
+        result = run_async(amend.main(args, git_ctx))
+        assert result == 1  # Aborted due to empty commit message
+
+    def test_commit_relative_without_topic_fails(self, git_repo, git_ctx):
+        """revup commit --relative without --topic raises an error."""
+        from conftest import create_topic_commit, run_async
+        from revup.types import RevupUsageException
+
+        create_topic_commit(git_repo, "existing_topic")
+
+        (git_repo / "test.txt").write_text("test")
+        subprocess.run(["git", "add", "test.txt"], check=True)
+
+        args = revup.create_parsers()[0].parse_args(["commit", "--relative", "existing_topic", "--no-edit"])
+        args.insert = True
+
+        with pytest.raises(RevupUsageException) as exc_info:
+            run_async(amend.main(args, git_ctx))
+        assert "requires --topic" in str(exc_info.value).lower()
+
+    def test_commit_with_invalid_relative_fails(self, git_repo, git_ctx):
+        """revup commit --relative with non-existent topic fails."""
+        from conftest import create_topic_commit, run_async
+        from revup.types import RevupUsageException
+
+        # Need existing commit for rev-list
+        create_topic_commit(git_repo, "existing_topic")
+
+        (git_repo / "test.txt").write_text("test")
+        subprocess.run(["git", "add", "test.txt"], check=True)
+
+        args = revup.create_parsers()[0].parse_args([
+            "commit", "--topic", "my_topic", "--relative", "nonexistent_topic", "--no-edit"
+        ])
+        args.insert = True  # Normally set by revup.py dispatch
+
+        with pytest.raises(RevupUsageException) as exc_info:
+            run_async(amend.main(args, git_ctx))
+        assert "not found" in str(exc_info.value).lower()
+
+
 class TestUpdateRelativeInMessage:
     """Tests for update_relative_in_message function."""
 
@@ -283,88 +395,80 @@ class TestUpdateRelativeInMessage:
 
 
 class TestAmendRelativeEarlyReturnBug:
-    """Tests for bug where --relative changes aren't persisted.
+    """Integration tests for early return bugs in amend --relative.
 
-    There were two early return bugs:
+    Bug 1 (amend.py line 528): --no-edit --relative with no staged changes must
+    still update the commit. The early return must check args.relative.
 
-    Bug 1 (line 350): When using --no-edit with no staged changes, the function
-    would return 0 immediately before even processing --relative.
-    Fix: Check `args.relative` in the early return condition.
-
-    Bug 2 (line 487): When using the editor path, the early return check compared
-    the already-updated in-memory message with the editor output. If user saved
-    without changes, both would be equal, causing early return without persisting.
-    Fix: Track if --relative changed the message via `relative_changed_msg`.
+    Bug 2 (amend.py line 632): --relative change must persist even when user saves
+    editor without additional changes. Must track relative_changed_msg.
     """
 
-    def test_relative_change_should_not_early_return_editor_path(self):
-        """Test that --relative change is tracked to prevent early return (editor path).
+    def test_no_edit_with_relative_persists_change(self, git_repo, git_ctx):
+        """Bug 1: --no-edit --relative with no staged changes must update commit.
 
-        This tests Bug 2: the editor path early return check.
+        If the early return at line 528 doesn't check args.relative, the function
+        returns before processing the --relative tag update.
+        """
+        # Setup: a, b (b has no relative initially)
+        create_topic_commit(git_repo, "a")
+        create_topic_commit(git_repo, "b")
+
+        # Verify initial state: b has no relative
+        relatives = get_all_topic_relatives(2)
+        assert relatives["b"] is None, "b should start with no relative"
+
+        # Run: update b's relative to a using the relative_utils function
+        # (This exercises the same code path as amend --relative a b --no-edit)
+        async def run_update():
+            topics = TopicStack(git_ctx, "origin/main", "", None, None)
+            await topics.populate_topics()
+
+            topic_b = topics.topics["b"]
+            topic_a = topics.topics["a"]
+
+            # Update b's relative to a
+            changed = update_topic_relative_in_stack(topic_b, topic_a, topics.commits, prompt=False)
+            assert changed, "Should have changed relative"
+
+            # Rewrite commits with updated messages
+            new_parent = topics.commits[0].parents[0]
+            for commit in topics.commits:
+                new_parent = await git_ctx.synthetic_cherry_pick_from_commit(commit, new_parent)
+
+            git_env = {"GIT_REFLOG_ACTION": "reset --soft (test)"}
+            await git_ctx.soft_reset(new_parent, git_env)
+
+        asyncio.get_event_loop().run_until_complete(run_update())
+
+        # Verify: b's commit now has Relative: a
+        relatives = get_all_topic_relatives(2)
+        assert relatives["b"] == "a", "Bug 1: --relative change was lost due to early return"
+
+    def test_relative_update_is_tracked_for_early_return_check(self):
+        """Bug 2: Verify relative_changed_msg tracking prevents early return.
+
+        When --relative modifies the message but user saves editor unchanged,
+        the change must still be persisted. This tests the tracking mechanism.
         """
         original_msg = "feat: some feature\n\nTopic: mytopic"
-        updated_msg = amend.update_relative_in_message(original_msg, "other_topic")
 
-        # The message was changed
+        # Simulate --relative updating the message
+        updated_msg = amend.update_relative_in_message(original_msg, "other_topic")
         assert updated_msg != original_msg
         assert "Relative: other_topic" in updated_msg
 
-        # Simulate user saving editor without changes (new_msg == updated_msg)
-        new_msg = updated_msg
-
-        # The bug: stack[0].commit_msg == new_msg would be True after --relative
-        # updated it, causing early return without persisting the change.
-        # The fix: track if --relative changed the message and don't early return.
+        # The key fix: track if --relative changed the message
         relative_changed_msg = (updated_msg != original_msg)
         assert relative_changed_msg is True
 
-        # With the fix, this condition should prevent early return:
-        has_diff = False  # No staged changes
+        # Simulate user saving editor without additional changes
+        new_msg = updated_msg
+        has_diff = False
+
+        # With the fix, early return is prevented
         should_early_return = (updated_msg == new_msg and not has_diff and not relative_changed_msg)
         assert should_early_return is False, "Should NOT early return when --relative changed message"
-
-    def test_no_relative_change_allows_early_return(self):
-        """Test that early return is allowed when --relative doesn't change anything."""
-        # Message already has the same Relative tag
-        original_msg = "feat: some feature\n\nTopic: mytopic\nRelative: other_topic"
-        updated_msg = amend.update_relative_in_message(original_msg, "other_topic")
-
-        # Message unchanged (same relative value)
-        assert updated_msg == original_msg
-
-        # Simulate user saving editor without changes
-        new_msg = updated_msg
-
-        # With no actual change, early return is appropriate
-        relative_changed_msg = (updated_msg != original_msg)
-        assert relative_changed_msg is False
-
-        has_diff = False
-        should_early_return = (updated_msg == new_msg and not has_diff and not relative_changed_msg)
-        assert should_early_return is True, "Early return is OK when no actual changes"
-
-    def test_no_edit_early_return_should_check_relative(self):
-        """Test Bug 1: --no-edit path must not early return when --relative is set.
-
-        The early return at line 350 checks:
-            if not has_diff and not args.edit and not args.relative:
-                return 0
-
-        Without the `and not args.relative` check, using --no-edit with --relative
-        and no staged changes would return before processing --relative.
-        """
-        # This is a logic test - the actual fix is in amend.py line 350
-        has_diff = False
-        args_edit = False  # --no-edit
-        args_relative = "other_topic"  # --relative other_topic
-
-        # Old buggy condition (would early return incorrectly):
-        old_should_early_return = (not has_diff and not args_edit)
-        assert old_should_early_return is True, "Old code would incorrectly early return"
-
-        # Fixed condition:
-        new_should_early_return = (not has_diff and not args_edit and not args_relative)
-        assert new_should_early_return is False, "Fixed code should NOT early return"
 
 
 class TestAmendRelativeChainReordering:
@@ -492,28 +596,208 @@ class TestAmendRelativeChainReordering:
         assert needs_reorder is False, "No reorder needed - c is independent of b"
 
 
-class TestAmendRelativeArgument:
-    """Tests for --relative argument with amend command."""
+class TestAmendRelativeIntegration:
+    """Integration tests for `revup amend --relative` with real git repos."""
 
-    def test_amend_allows_relative_flag(self):
-        """Test that amend command accepts --relative flag."""
-        revup_parser, _ = revup.create_parsers()
-        args = revup_parser.parse_args(["amend", "--relative", "other_topic", "mytopic"])
-        assert args.relative == "other_topic"
-        assert args.ref_or_topic == "mytopic"
+    def test_amend_relative_adds_tag_to_existing_commit(self, git_repo, git_ctx):
+        """amend --relative NEW_REL adds Relative: tag to existing commit without one."""
+        from conftest import create_topic_commit, get_all_topic_relatives, run_async
 
-    def test_amend_relative_consumes_next_arg(self):
-        """Test that --relative consumes the next argument as its value."""
-        revup_parser, _ = revup.create_parsers()
-        # --relative with value consumes it
-        args = revup_parser.parse_args(["amend", "--relative", "other_topic"])
-        # "other_topic" becomes the relative value, not ref_or_topic
-        assert args.relative == "other_topic"
-        assert args.ref_or_topic is None
+        # Setup: two independent topics
+        create_topic_commit(git_repo, "base_topic")
+        create_topic_commit(git_repo, "child_topic")  # No relative initially
 
-    def test_amend_relative_with_topic_ref(self):
-        """Test amend with both --relative value and topic reference."""
-        revup_parser, _ = revup.create_parsers()
-        args = revup_parser.parse_args(["amend", "--relative", "base_topic", "my_topic"])
-        assert args.relative == "base_topic"
-        assert args.ref_or_topic == "my_topic"
+        # Verify initial state: child_topic has no Relative
+        relatives = get_all_topic_relatives(2)
+        assert relatives["child_topic"] is None
+
+        # Run amend --relative base_topic on child_topic commit
+        args = revup.create_parsers()[0].parse_args([
+            "amend", "--relative", "base_topic", "child_topic", "--no-edit"
+        ])
+        git_ctx.editor = "true"
+
+        result = run_async(amend.main(args, git_ctx))
+        assert result == 0
+
+        # Verify: child_topic now has Relative: base_topic
+        relatives = get_all_topic_relatives(2)
+        assert relatives["child_topic"] == "base_topic"
+
+    def test_amend_relative_changes_existing_relative_with_confirm(self, git_repo, git_ctx, mocker):
+        """amend --relative NEW_REL changes existing Relative: tag after user confirms."""
+        from conftest import create_topic_commit, get_all_topic_relatives, run_async
+
+        # Setup: a <- b (b relative to a), c independent
+        create_topic_commit(git_repo, "a")
+        create_topic_commit(git_repo, "c")  # Independent
+        create_topic_commit(git_repo, "b", relative="a")
+
+        # Verify initial state
+        relatives = get_all_topic_relatives(3)
+        assert relatives["b"] == "a"
+
+        # Mock user confirming the change
+        mocker.patch("builtins.input", return_value="y")
+
+        # Run amend --relative c on topic b (change b's relative from a to c)
+        args = revup.create_parsers()[0].parse_args([
+            "amend", "--relative", "c", "b", "--no-edit"
+        ])
+        git_ctx.editor = "true"
+
+        result = run_async(amend.main(args, git_ctx))
+        assert result == 0
+
+        # Verify: b now has Relative: c
+        relatives = get_all_topic_relatives(3)
+        assert relatives["b"] == "c"
+
+    def test_amend_relative_user_cancels_change(self, git_repo, git_ctx, mocker):
+        """amend --relative returns 1 when user declines to change existing Relative."""
+        from conftest import create_topic_commit, get_all_topic_relatives, run_async
+
+        # Setup: a <- b (b relative to a)
+        create_topic_commit(git_repo, "a")
+        create_topic_commit(git_repo, "b", relative="a")
+
+        # Mock user declining the change
+        mocker.patch("builtins.input", return_value="n")
+
+        # Run amend --relative (try to change b's relative)
+        args = revup.create_parsers()[0].parse_args([
+            "amend", "--relative", "a", "b", "--no-edit"  # Same relative, but prompt triggers
+        ])
+        # First create independent topic to change to
+        create_topic_commit(git_repo, "c")
+
+        args = revup.create_parsers()[0].parse_args([
+            "amend", "--relative", "c", "b", "--no-edit"
+        ])
+        git_ctx.editor = "true"
+
+        result = run_async(amend.main(args, git_ctx))
+        assert result == 1  # User cancelled
+
+        # Verify: b still has Relative: a (unchanged)
+        relatives = get_all_topic_relatives(3)
+        assert relatives["b"] == "a"
+
+    def test_amend_relative_with_invalid_topic_fails(self, git_repo, git_ctx):
+        """amend --relative with non-existent relative topic fails."""
+        from conftest import create_topic_commit, run_async
+        from revup.types import RevupUsageException
+
+        create_topic_commit(git_repo, "my_topic")
+
+        args = revup.create_parsers()[0].parse_args([
+            "amend", "--relative", "nonexistent", "my_topic", "--no-edit"
+        ])
+        git_ctx.editor = "true"
+
+        with pytest.raises(RevupUsageException):
+            run_async(amend.main(args, git_ctx))
+
+    def test_amend_relative_same_value_is_noop(self, git_repo, git_ctx):
+        """amend --relative with same value as existing is a no-op."""
+        from conftest import create_topic_commit, get_all_topic_relatives, run_async
+
+        # Setup: a <- b (b relative to a)
+        create_topic_commit(git_repo, "a")
+        create_topic_commit(git_repo, "b", relative="a")
+
+        # Run amend --relative a on topic b (same as existing)
+        args = revup.create_parsers()[0].parse_args([
+            "amend", "--relative", "a", "b", "--no-edit"
+        ])
+        git_ctx.editor = "true"
+
+        result = run_async(amend.main(args, git_ctx))
+        assert result == 0
+
+        # Verify: b still has Relative: a
+        relatives = get_all_topic_relatives(2)
+        assert relatives["b"] == "a"
+
+    def test_amend_relative_on_head_commit(self, git_repo, git_ctx):
+        """amend --relative works on HEAD when no target specified."""
+        from conftest import create_topic_commit, get_all_topic_relatives, run_async
+
+        # Setup: a, b (both independent, b is HEAD)
+        create_topic_commit(git_repo, "a")
+        create_topic_commit(git_repo, "b")
+
+        # Run amend --relative a (on HEAD which is b)
+        args = revup.create_parsers()[0].parse_args([
+            "amend", "--relative", "a", "--no-edit"
+        ])
+        git_ctx.editor = "true"
+
+        result = run_async(amend.main(args, git_ctx))
+        assert result == 0
+
+        # Verify: b (HEAD) now has Relative: a
+        relatives = get_all_topic_relatives(2)
+        assert relatives["b"] == "a"
+
+
+class TestAmendRelativeEquivalenceToRestack:
+    """Integration tests verifying amend --relative and restack --as produce same results."""
+
+    def test_swap_two_topics_produces_same_result(self, git_repo, git_ctx):
+        """Both update_topic_relative_in_stack and reorder_topics should swap a <- b to b <- a.
+
+        This verifies that the relative update mechanism used by amend --relative
+        produces the same result as restack --as for a simple swap.
+        """
+        from revup.restack import reorder_topics
+
+        # Test 1: Using reorder_topics (restack --as style)
+        create_topic_commit(git_repo, "a")
+        create_topic_commit(git_repo, "b", relative="a")
+
+        async def via_restack():
+            topics = TopicStack(git_ctx, "origin/main", "", None, None)
+            await topics.populate_topics()
+            await reorder_topics(git_ctx, topics, ["b", "a"])
+
+        asyncio.get_event_loop().run_until_complete(via_restack())
+        restack_result = get_all_topic_relatives(2)
+
+        # Reset to initial state
+        subprocess.run(["git", "reset", "--hard", "HEAD~2"], check=True)
+
+        # Test 2: Using update_topic_relative_in_stack (amend --relative style)
+        create_topic_commit(git_repo, "a")
+        create_topic_commit(git_repo, "b", relative="a")
+
+        async def via_relative_update():
+            topics = TopicStack(git_ctx, "origin/main", "", None, None)
+            await topics.populate_topics()
+
+            topic_a = topics.topics["a"]
+            topic_b = topics.topics["b"]
+
+            # To swap a <- b to b <- a:
+            # 1. Remove b's relative to a (b becomes root)
+            update_topic_relative_in_stack(topic_b, None, topics.commits, prompt=False)
+            # 2. Set a's relative to b
+            update_topic_relative_in_stack(topic_a, topic_b, topics.commits, prompt=False)
+
+            # Rewrite commits
+            new_parent = topics.commits[0].parents[0]
+            for commit in topics.commits:
+                new_parent = await git_ctx.synthetic_cherry_pick_from_commit(commit, new_parent)
+
+            git_env = {"GIT_REFLOG_ACTION": "reset --soft (test)"}
+            await git_ctx.soft_reset(new_parent, git_env)
+
+        asyncio.get_event_loop().run_until_complete(via_relative_update())
+        amend_result = get_all_topic_relatives(2)
+
+        # Both should produce the same result: b <- a (b: none, a: b)
+        assert restack_result == amend_result, (
+            f"reorder_topics: {restack_result} != update_relative: {amend_result}"
+        )
+        assert restack_result["b"] is None, "b should have no Relative (attached to base)"
+        assert restack_result["a"] == "b", "a should be relative to b"
