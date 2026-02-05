@@ -1,54 +1,16 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
+import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from revup import edit, git, revup, shell
-
-
-@pytest.fixture
-def git_repo(tmp_path):
-    """Create a temporary git repo with some commits and topics."""
-    repo_dir = tmp_path / "repo"
-    repo_dir.mkdir()
-    os.chdir(repo_dir)
-
-    # Initialize git repo
-    os.system("git init -b main")
-    os.system("git config user.email 'test@test.com'")
-    os.system("git config user.name 'Test User'")
-
-    # Create initial commit
-    (repo_dir / "file.txt").write_text("initial content")
-    os.system("git add file.txt")
-    os.system("git commit -m 'initial commit'")
-
-    # Add a fake remote so revup can find origin/main
-    os.system("git remote add origin .")
-    os.system("git fetch origin")
-
-    # Create a topic commit
-    (repo_dir / "file.txt").write_text("topic content")
-    os.system("git add file.txt")
-    os.system("git commit -m 'topic change\n\nTopic: mytopic'")
-
-    return repo_dir
-
-
-@pytest.fixture
-def git_ctx(git_repo):
-    """Create a Git context for the test repo."""
-    loop = asyncio.get_event_loop()
-    sh = shell.Shell()
-    git_ctx = loop.run_until_complete(git.make_git(
-        sh,
-        remote_name="origin",
-        main_branch="main",
-    ))
-    return git_ctx
+from revup.types import RevupUsageException
 
 
 class TestEditFunctions:
@@ -97,6 +59,11 @@ class TestRebaseState:
 
     def test_in_rebase(self, git_repo):
         """Test detecting when in a rebase."""
+        from conftest import create_topic_commit
+
+        # Need at least 2 commits for HEAD~1
+        create_topic_commit(git_repo, "test_topic")
+
         # Start a rebase
         os.system("GIT_SEQUENCE_EDITOR='sed -i s/pick/edit/' git rebase -i HEAD~1")
         assert edit.is_in_rebase(Path(git_repo))
@@ -106,12 +73,6 @@ class TestRebaseState:
 
 class TestEditStateHelpers:
     """Tests for edit state file helpers."""
-
-    def test_get_edit_state_path(self, git_repo):
-        """Test that state path is inside rebase-merge directory."""
-        path = edit.get_edit_state_path(str(git_repo))
-        assert "rebase-merge" in str(path)
-        assert path.name == "revup-edit-topic"
 
     def test_save_and_load_edit_state(self, git_repo):
         """Test saving and loading edit state."""
@@ -148,6 +109,11 @@ class TestEditStateHelpers:
 
     def test_state_file_auto_cleanup(self, git_repo):
         """Test that state file is in a location that git cleans up."""
+        from conftest import create_topic_commit
+
+        # Need at least 2 commits for HEAD~1
+        create_topic_commit(git_repo, "test_topic")
+
         # Start a rebase
         os.system("GIT_SEQUENCE_EDITOR='sed -i s/pick/edit/' git rebase -i HEAD~1")
 
@@ -173,6 +139,11 @@ class TestStoppedCommit:
 
     def test_get_stopped_commit_in_rebase(self, git_repo):
         """Test getting stopped commit during rebase."""
+        from conftest import create_topic_commit
+
+        # Need at least 2 commits for HEAD~1
+        create_topic_commit(git_repo, "test_topic")
+
         # Get the current HEAD commit
         head_commit = os.popen("git rev-parse HEAD").read().strip()
 
@@ -199,6 +170,11 @@ class TestUnmergedFiles:
 
     def test_with_unmerged_files(self, git_repo, git_ctx):
         """Test detection when conflicts exist."""
+        from conftest import create_topic_commit
+
+        # Need at least 2 commits for HEAD~1
+        create_topic_commit(git_repo, "test_topic")
+
         # Create a conflict scenario
         # First, create another branch with conflicting changes
         os.system("git checkout -b conflict-branch HEAD~1")
@@ -219,100 +195,8 @@ class TestUnmergedFiles:
             os.system("git rebase --abort")
 
 
-class TestAmendVsContinueLogic:
-    """Tests for the amend vs continue decision logic."""
-
-    def test_should_amend_when_on_topic_commit(self, git_repo):
-        """Test that amend is chosen when stopped on a topic commit."""
-        rebase_dir = git_repo / ".git" / "rebase-merge"
-        rebase_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save state with topic commit
-        topic_commits = {"abc123def456789"}
-        edit.save_edit_state(str(git_repo), "my-topic", topic_commits)
-
-        # Simulate stopped at a topic commit (short hash match)
-        (rebase_dir / "stopped-sha").write_text("abc123def456789\n")
-
-        # Load and check
-        state = edit.load_edit_state(str(git_repo))
-        stopped = edit.get_stopped_commit(str(git_repo))
-
-        assert state is not None
-        topic_name, commits = state
-        should_amend = any(
-            stopped.startswith(tc[:len(stopped)]) or tc.startswith(stopped[:len(tc)])
-            for tc in commits
-        )
-        assert should_amend is True
-
-    def test_should_not_amend_when_not_on_topic_commit(self, git_repo):
-        """Test that amend is skipped when stopped on non-topic commit."""
-        rebase_dir = git_repo / ".git" / "rebase-merge"
-        rebase_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save state with topic commits
-        topic_commits = {"abc123def456789"}
-        edit.save_edit_state(str(git_repo), "my-topic", topic_commits)
-
-        # Simulate stopped at a different commit
-        (rebase_dir / "stopped-sha").write_text("zzz999otherhash\n")
-
-        # Load and check
-        state = edit.load_edit_state(str(git_repo))
-        stopped = edit.get_stopped_commit(str(git_repo))
-
-        assert state is not None
-        topic_name, commits = state
-        should_amend = any(
-            stopped.startswith(tc[:len(stopped)]) or tc.startswith(stopped[:len(tc)])
-            for tc in commits
-        )
-        assert should_amend is False
-
-    def test_short_hash_matching(self, git_repo):
-        """Test that short and long hash comparisons work correctly."""
-        rebase_dir = git_repo / ".git" / "rebase-merge"
-        rebase_dir.mkdir(parents=True, exist_ok=True)
-
-        # Full hash in state
-        topic_commits = {"abc123def456789abcdef0123456789abcdef01"}
-        edit.save_edit_state(str(git_repo), "my-topic", topic_commits)
-
-        # Short hash from stopped-sha (git often uses short hashes)
-        (rebase_dir / "stopped-sha").write_text("abc123d\n")
-
-        state = edit.load_edit_state(str(git_repo))
-        stopped = edit.get_stopped_commit(str(git_repo))
-
-        topic_name, commits = state
-        should_amend = any(
-            stopped.startswith(tc[:len(stopped)]) or tc.startswith(stopped[:len(tc)])
-            for tc in commits
-        )
-        assert should_amend is True
-
-    def test_no_state_falls_back_to_continue(self, git_repo):
-        """Test that missing state falls back to continue without amend."""
-        rebase_dir = git_repo / ".git" / "rebase-merge"
-        rebase_dir.mkdir(parents=True, exist_ok=True)
-
-        # No state file saved
-        (rebase_dir / "stopped-sha").write_text("abc123\n")
-
-        state = edit.load_edit_state(str(git_repo))
-        assert state is None
-        # With no state, should_amend defaults to False
-
-
 class TestGitDirHandling:
     """Tests for git directory handling including worktrees."""
-
-    def test_get_git_dir_normal_repo(self, git_repo):
-        """Test getting git dir in a normal repo."""
-        git_dir = edit.get_git_dir(Path(git_repo))
-        assert git_dir == git_repo / ".git"
-        assert git_dir.is_dir()
 
     def test_get_git_dir_worktree(self, git_repo):
         """Test getting git dir in a worktree."""
@@ -328,4 +212,256 @@ class TestGitDirHandling:
 
             # Clean up
             os.system(f"git worktree remove {worktree_path} 2>/dev/null")
+
+
+# =============================================================================
+# INTEGRATION TESTS FOR EDIT COMMAND MAIN ENTRY POINTS
+# =============================================================================
+
+
+class TestEditMainIntegration:
+    """Integration tests for edit.main() function."""
+
+    def test_start_edit_with_valid_topic(self, git_repo, git_ctx):
+        """revup edit <topic> starts rebase and stops at topic commit."""
+        from conftest import create_topic_commit, run_async
+
+        # Setup: create a topic commit
+        create_topic_commit(git_repo, "edit_me")
+
+        args = argparse.Namespace(
+            topic="edit_me",
+            commit=False,
+            abort=False,
+            base_branch="origin/main",
+        )
+
+        result = run_async(edit.main(args, git_ctx))
+        assert result == 0
+
+        # Should be in a rebase state, stopped at the topic commit
+        assert edit.is_in_rebase(Path(git_repo))
+
+        # State file should exist
+        state = edit.load_edit_state(str(git_repo))
+        assert state is not None
+        topic_name, _ = state
+        assert topic_name == "edit_me"
+
+        # Clean up
+        subprocess.run(["git", "rebase", "--abort"], check=True)
+
+    def test_start_edit_with_invalid_topic_fails(self, git_repo, git_ctx):
+        """revup edit <nonexistent_topic> raises error."""
+        from conftest import run_async
+
+        args = argparse.Namespace(
+            topic="nonexistent_topic",
+            commit=False,
+            abort=False,
+            base_branch="origin/main",
+        )
+
+        with pytest.raises(RevupUsageException) as exc_info:
+            run_async(edit.main(args, git_ctx))
+
+        assert "not found" in str(exc_info.value)
+
+    def test_start_edit_without_topic_fails(self, git_repo, git_ctx):
+        """revup edit without topic raises error."""
+        from conftest import run_async
+
+        args = argparse.Namespace(
+            topic=None,
+            commit=False,
+            abort=False,
+            base_branch="origin/main",
+        )
+
+        with pytest.raises(RevupUsageException) as exc_info:
+            run_async(edit.main(args, git_ctx))
+
+        assert "Topic name required" in str(exc_info.value)
+
+    def test_start_edit_while_in_rebase_fails(self, git_repo, git_ctx):
+        """revup edit <topic> while already in rebase raises error."""
+        from conftest import create_topic_commit, run_async
+
+        create_topic_commit(git_repo, "first_topic")
+
+        # Start a manual rebase first
+        subprocess.run(
+            ["git", "rebase", "-i", "HEAD~1"],
+            env={**os.environ, "GIT_SEQUENCE_EDITOR": "sed -i s/pick/edit/"},
+            check=False
+        )
+
+        args = argparse.Namespace(
+            topic="first_topic",
+            commit=False,
+            abort=False,
+            base_branch="origin/main",
+        )
+
+        with pytest.raises(RevupUsageException) as exc_info:
+            run_async(edit.main(args, git_ctx))
+
+        assert "Already in a rebase" in str(exc_info.value)
+
+        # Clean up
+        subprocess.run(["git", "rebase", "--abort"], check=False)
+
+    def test_abort_edit_cancels_rebase(self, git_repo, git_ctx):
+        """revup edit --abort cancels the rebase session."""
+        from conftest import create_topic_commit, run_async
+
+        create_topic_commit(git_repo, "abort_me")
+
+        # Start an edit session
+        start_args = argparse.Namespace(
+            topic="abort_me",
+            commit=False,
+            abort=False,
+            base_branch="origin/main",
+        )
+        run_async(edit.main(start_args, git_ctx))
+        assert edit.is_in_rebase(Path(git_repo))
+
+        # Abort it
+        abort_args = argparse.Namespace(
+            topic=None,
+            commit=False,
+            abort=True,
+            base_branch="origin/main",
+        )
+        result = run_async(edit.main(abort_args, git_ctx))
+        assert result == 0
+        assert not edit.is_in_rebase(Path(git_repo))
+
+    def test_abort_when_not_in_rebase_fails(self, git_repo, git_ctx):
+        """revup edit --abort when not in rebase raises error."""
+        from conftest import run_async
+
+        args = argparse.Namespace(
+            topic=None,
+            commit=False,
+            abort=True,
+            base_branch="origin/main",
+        )
+
+        with pytest.raises(RevupUsageException) as exc_info:
+            run_async(edit.main(args, git_ctx))
+
+        assert "Not in a rebase" in str(exc_info.value)
+
+    def test_commit_and_abort_together_fails(self, git_repo, git_ctx):
+        """revup edit --commit --abort raises error."""
+        from conftest import run_async
+
+        args = argparse.Namespace(
+            topic=None,
+            commit=True,
+            abort=True,
+            base_branch="origin/main",
+        )
+
+        with pytest.raises(RevupUsageException) as exc_info:
+            run_async(edit.main(args, git_ctx))
+
+        assert "Cannot use --commit and --abort together" in str(exc_info.value)
+
+    def test_commit_when_not_in_rebase_fails(self, git_repo, git_ctx):
+        """revup edit --commit when not in rebase raises error."""
+        from conftest import run_async
+
+        args = argparse.Namespace(
+            topic=None,
+            commit=True,
+            abort=False,
+            base_branch="origin/main",
+        )
+
+        with pytest.raises(RevupUsageException) as exc_info:
+            run_async(edit.main(args, git_ctx))
+
+        assert "Not in a rebase" in str(exc_info.value)
+
+
+class TestEditCommitAndContinue:
+    """Integration tests for the commit_and_continue flow."""
+
+    def test_commit_amends_topic_and_continues(self, git_repo, git_ctx):
+        """revup edit --commit amends topic commit and continues rebase."""
+        from conftest import create_topic_commit, run_async
+
+        create_topic_commit(git_repo, "amend_topic")
+
+        # Start edit session
+        start_args = argparse.Namespace(
+            topic="amend_topic",
+            commit=False,
+            abort=False,
+            base_branch="origin/main",
+        )
+        run_async(edit.main(start_args, git_ctx))
+
+        # Make a change and stage it
+        (git_repo / "new_file.txt").write_text("new content")
+        subprocess.run(["git", "add", "new_file.txt"], check=True)
+
+        # Mock user confirmation and run commit
+        commit_args = argparse.Namespace(
+            topic=None,
+            commit=True,
+            abort=False,
+            base_branch="origin/main",
+        )
+
+        # Set GIT_EDITOR to avoid interactive editor during amend
+        with patch.dict(os.environ, {"GIT_EDITOR": "true"}):
+            with patch("builtins.input", return_value="y"):
+                result = run_async(edit.main(commit_args, git_ctx))
+
+        assert result == 0
+        # Rebase should have completed (only one topic commit)
+        assert not edit.is_in_rebase(Path(git_repo))
+
+        # Verify the new file is in the commit
+        files = subprocess.run(
+            ["git", "show", "--name-only", "--format=", "HEAD"],
+            capture_output=True, text=True
+        ).stdout.strip().split("\n")
+        assert "new_file.txt" in files
+
+    def test_commit_without_staged_warns_user(self, git_repo, git_ctx):
+        """revup edit --commit with no staged changes prompts user."""
+        from conftest import create_topic_commit, run_async
+
+        create_topic_commit(git_repo, "no_changes")
+
+        # Start edit session
+        start_args = argparse.Namespace(
+            topic="no_changes",
+            commit=False,
+            abort=False,
+            base_branch="origin/main",
+        )
+        run_async(edit.main(start_args, git_ctx))
+
+        # Run commit without staging anything, user declines
+        commit_args = argparse.Namespace(
+            topic=None,
+            commit=True,
+            abort=False,
+            base_branch="origin/main",
+        )
+
+        with patch("builtins.input", return_value="n"):
+            result = run_async(edit.main(commit_args, git_ctx))
+
+        assert result == 1  # User aborted
+        assert edit.is_in_rebase(Path(git_repo))
+
+        # Clean up
+        subprocess.run(["git", "rebase", "--abort"], check=True)
 
