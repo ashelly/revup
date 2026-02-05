@@ -209,6 +209,14 @@ async def main() -> int:
         "toolkit", description="Exercise various subfunctionalities."
     )
 
+    tree_parser = subparsers.add_parser(
+        "tree", add_help=False, description="Display topic dependency tree."
+    )
+    tree_parser.add_argument("--help", "-h", action=HelpAction, nargs=0)
+    tree_parser.add_argument("--base-branch", "-b")
+    tree_parser.add_argument("--relative-branch", "-e")
+    tree_parser.add_argument("--debug", "-d", action="store_true")
+
     # Intentionally does not contain config or toolkit parsers since the those are not configurable
     all_parsers: List[RevupArgParser] = [
         revup_parser,
@@ -388,6 +396,11 @@ async def main() -> int:
         from revup import restack
 
         return await restack.main(args=args, git_ctx=git_ctx)
+
+    elif args.cmd == "tree":
+        from revup import tree
+
+        return await tree.main(args=args, git_ctx=git_ctx)
 
     async with github_connection(args=args, git_ctx=git_ctx, conf=conf) as (
         github_ep,
