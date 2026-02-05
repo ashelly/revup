@@ -367,6 +367,131 @@ class TestAmendRelativeEarlyReturnBug:
         assert new_should_early_return is False, "Fixed code should NOT early return"
 
 
+class TestAmendRelativeChainReordering:
+    """Tests for chain reordering when amend --relative would create a cycle.
+
+    When using `revup amend --relative NEW_REL TARGET`, if NEW_REL is currently
+    a descendant of TARGET (below it in the chain), we need to "extract" NEW_REL
+    first to avoid creating a cycle.
+
+    Test cases from the plan:
+    | Original | Command | Result | Changes |
+    |----------|---------|--------|---------|
+    | a <- b <- c | amend -r c b | a <- c <- b | c: b→a, b: a→c |
+    | a <- b <- c <- d <- e | amend -r e b | a <- e <- b <- c <- d | e: d→a, b: a→e |
+    | a <- b, c (indep) | amend -r c b | a <- c <- b | b: a→c |
+    | a <- b <- c | amend -r a c | a <- c, a <- b | c: b→a (branch) |
+    | a <- b | amend -r b a | a <- b (no-op) | already correct |
+    """
+
+    def test_is_ancestor_direct_parent(self):
+        """Test is_ancestor returns True for direct parent relationship."""
+        from revup.topic_stack import Topic, is_ancestor
+
+        # a <- b (b's relative is a)
+        a = Topic(name="a")
+        b = Topic(name="b", relative_topic=a)
+
+        assert is_ancestor(a, b) is True
+        assert is_ancestor(b, a) is False
+
+    def test_is_ancestor_grandparent(self):
+        """Test is_ancestor returns True for grandparent relationship."""
+        from revup.topic_stack import Topic, is_ancestor
+
+        # a <- b <- c
+        a = Topic(name="a")
+        b = Topic(name="b", relative_topic=a)
+        c = Topic(name="c", relative_topic=b)
+
+        assert is_ancestor(a, c) is True
+        assert is_ancestor(b, c) is True
+        assert is_ancestor(c, a) is False
+        assert is_ancestor(c, b) is False
+
+    def test_is_ancestor_unrelated_topics(self):
+        """Test is_ancestor returns False for unrelated topics."""
+        from revup.topic_stack import Topic, is_ancestor
+
+        # a <- b, c (independent)
+        a = Topic(name="a")
+        b = Topic(name="b", relative_topic=a)
+        c = Topic(name="c")  # No relative
+
+        assert is_ancestor(a, c) is False
+        assert is_ancestor(b, c) is False
+        assert is_ancestor(c, b) is False
+
+    def test_is_ancestor_self(self):
+        """Test is_ancestor returns False when checking against self."""
+        from revup.topic_stack import Topic, is_ancestor
+
+        a = Topic(name="a")
+        assert is_ancestor(a, a) is False
+
+    def test_chain_reorder_needed_when_new_rel_is_descendant(self):
+        """Test that we detect when chain reordering is needed.
+
+        If setting b's relative to c, but c is currently below b (c's ancestor
+        chain includes b), then c needs to be extracted first.
+
+        Original: a <- b <- c
+        Command: amend -r c b (set b's relative to c)
+        Detection: is_ancestor(b, c) is True -> c is below b -> reorder needed
+        """
+        from revup.topic_stack import Topic, is_ancestor
+
+        # a <- b <- c
+        a = Topic(name="a")
+        b = Topic(name="b", relative_topic=a)
+        c = Topic(name="c", relative_topic=b)
+
+        # We want to set b's relative to c
+        target = b
+        new_relative = c
+
+        # Check if new_relative is a descendant of target
+        needs_reorder = is_ancestor(target, new_relative)
+        assert needs_reorder is True, "Should detect that c is below b"
+
+    def test_no_reorder_when_new_rel_is_ancestor(self):
+        """Test that reordering is not needed when new_rel is already an ancestor.
+
+        Original: a <- b
+        Command: amend -r a b (set b's relative to a) - already correct
+        """
+        from revup.topic_stack import Topic, is_ancestor
+
+        a = Topic(name="a")
+        b = Topic(name="b", relative_topic=a)
+
+        # We want to set b's relative to a (already the case)
+        target = b
+        new_relative = a
+
+        needs_reorder = is_ancestor(target, new_relative)
+        assert needs_reorder is False, "No reorder needed - a is already b's ancestor"
+
+    def test_no_reorder_when_topics_unrelated(self):
+        """Test that independent topics don't need reordering.
+
+        Original: a <- b, c (independent)
+        Command: amend -r c b (set b's relative to c)
+        c is not a descendant of b, so no cycle risk.
+        """
+        from revup.topic_stack import Topic, is_ancestor
+
+        a = Topic(name="a")
+        b = Topic(name="b", relative_topic=a)
+        c = Topic(name="c")  # Independent
+
+        target = b
+        new_relative = c
+
+        needs_reorder = is_ancestor(target, new_relative)
+        assert needs_reorder is False, "No reorder needed - c is independent of b"
+
+
 class TestAmendRelativeArgument:
     """Tests for --relative argument with amend command."""
 
